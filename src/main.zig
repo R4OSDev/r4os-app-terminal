@@ -90,6 +90,7 @@ const TerminalState = struct {
         self.initializeSession();
         if (run_autoexec) self.runAutoexec();
         self.printPrompt();
+        _ = self.sys.bootReady();
 
         var input: [INPUT_MAX]u8 = undefined;
         var len: usize = 0;

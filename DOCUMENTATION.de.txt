@@ -16,6 +16,9 @@ Stand 0.59.12:
   selbst.
 - TERMINAL.R4X liest keine COMMAND.R4S, TERMINAL.R4S oder Designwerte aus
   CONFIG.R4S oder DESKTOP.R4S.
+- Wenn Terminal die vom Bootloader ausgewaehlte Shell ist, meldet es
+  `boot_ready` erst nach optionalem AUTOEXEC und dem ersten ausgegebenen
+  Prompt. Andere Terminal-Instanzen koennen den Bootmessstand nicht beenden.
 - Feste Terminal-Defaults liegen im Terminal-Code. Eine Terminal-Settings-App
   oder Terminal-Design-Konfigurationsdatei gibt es nicht.
 - Der feste Default-`PATH` enthaelt nur die produktiven Terminal-Verzeichnisse
