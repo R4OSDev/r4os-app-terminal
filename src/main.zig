@@ -1,8 +1,9 @@
 const r4os = @import("r4os");
 const r4std = @import("r4std");
 
-const INPUT_MAX: usize = 128;
+const INPUT_MAX: usize = 4096;
 const HISTORY_DEPTH: usize = 16;
+const HISTORY_LINE_MAX: usize = 512;
 const PATH_MAX: usize = 128;
 const FILE_CHUNK_MAX: usize = 1024;
 const VERSION_FILE_MAX: usize = 256;
@@ -60,7 +61,7 @@ const PersistentPathRead = struct {
 const TerminalState = struct {
     sys: r4os.r4sys.Context,
     dev: r4os.r4dev.Context,
-    history: [HISTORY_DEPTH][INPUT_MAX]u8 = .{.{0} ** INPUT_MAX} ** HISTORY_DEPTH,
+    history: [HISTORY_DEPTH][HISTORY_LINE_MAX]u8 = .{.{0} ** HISTORY_LINE_MAX} ** HISTORY_DEPTH,
     history_lens: [HISTORY_DEPTH]usize = .{0} ** HISTORY_DEPTH,
     history_count: usize = 0,
     history_next: usize = 0,
@@ -1360,7 +1361,7 @@ const TerminalState = struct {
             const latest = self.historyIndexFromAge(0);
             if (self.history_lens[latest] == cleaned.len and equalsIgnoreCase(self.history[latest][0..self.history_lens[latest]], cleaned)) return;
         }
-        const count = if (cleaned.len < INPUT_MAX) cleaned.len else INPUT_MAX;
+        const count = @min(cleaned.len, HISTORY_LINE_MAX);
         @memcpy(self.history[self.history_next][0..count], cleaned[0..count]);
         self.history_lens[self.history_next] = count;
         self.history_next = (self.history_next + 1) % HISTORY_DEPTH;
@@ -2240,7 +2241,8 @@ fn isHelpSwitch(args: []const u8) bool {
 fn hasSelftestSwitch(s: []const u8) bool {
     var pos: usize = 0;
     while (nextToken(s, &pos)) |token| {
-        if (equalsIgnoreCase(token, "/SELFTEST") or equalsIgnoreCase(token, "--SELFTEST")) return true;
+        if (equalsIgnoreCase(token, "/SELFTEST") or equalsIgnoreCase(token, "--SELFTEST") or
+            equalsIgnoreCase(token, "/PERFTEST") or equalsIgnoreCase(token, "--PERFTEST")) return true;
     }
     return false;
 }
