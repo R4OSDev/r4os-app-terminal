@@ -27,6 +27,8 @@ const path_registry_value = "PATH";
 const KEY_UP: u8 = 0x80;
 const KEY_DOWN: u8 = 0x81;
 const KEY_F3: u8 = 0x82;
+const OUTPUT_TEST_ITERATIONS: u32 = 96;
+const output_test_chunk = "R4OS shared console transcript 0123456789ABCDEF\r\n";
 
 const Mode = enum {
     primary,
@@ -36,6 +38,7 @@ const Mode = enum {
     builtintest,
     launchtest,
     batchtest,
+    outputtest,
 };
 
 const BuiltinResult = enum {
@@ -86,6 +89,12 @@ const TerminalState = struct {
     redirect_error: bool = false,
     exit_requested: bool = false,
     redirect_path: [PATH_MAX:0]u8 = .{0} ** PATH_MAX,
+    input_buffer: [64]u8 = .{0} ** 64,
+    input_buffer_pos: usize = 0,
+    input_buffer_len: usize = 0,
+    input_generation: u64 = 0,
+    input_bulk_supported: bool = true,
+    input_wait_supported: bool = true,
 
     fn run(self: *TerminalState, run_autoexec: bool) i32 {
         self.initializeSession();
@@ -98,9 +107,8 @@ const TerminalState = struct {
         var history_age: ?usize = null;
 
         while (true) {
-            const c = self.sys.readKey();
+            const c = self.readInputByteBlocking() orelse return self.errorlevel;
             switch (c) {
-                0 => self.sys.taskYield(),
                 '\n' => {
                     self.write("\r\n");
                     self.addHistory(input[0..len]);
@@ -167,6 +175,11 @@ const TerminalState = struct {
         self.redirect_started = false;
         self.redirect_error = false;
         self.exit_requested = false;
+        self.input_buffer_pos = 0;
+        self.input_buffer_len = 0;
+        self.input_generation = 0;
+        self.input_bulk_supported = true;
+        self.input_wait_supported = true;
         _ = self.setPath(default_path);
         self.loadStartupPersistentPath();
         _ = self.setPrompt(default_prompt);
@@ -175,6 +188,64 @@ const TerminalState = struct {
         _ = self.setTemp(default_temp);
         _ = self.setBlaster("");
         self.syncProcessEnvironment();
+    }
+
+    fn readInputByteBlocking(self: *TerminalState) ?u8 {
+        while (true) {
+            if (self.input_buffer_pos < self.input_buffer_len) {
+                const value = self.input_buffer[self.input_buffer_pos];
+                self.input_buffer_pos += 1;
+                return value;
+            }
+            self.input_buffer_pos = 0;
+            self.input_buffer_len = 0;
+
+            if (self.input_bulk_supported) {
+                const read = self.sys.consoleRead(self.input_buffer[0..]);
+                if (read > 0) {
+                    self.input_buffer_len = @min(@as(usize, @intCast(read)), self.input_buffer.len);
+                    continue;
+                }
+                if (read < 0) self.input_bulk_supported = false;
+            }
+
+            if (self.sys.programShouldClose()) {
+                self.exit_requested = true;
+                return null;
+            }
+
+            if (self.input_wait_supported) {
+                var observed_generation = self.input_generation;
+                const wait_result = self.sys.consoleInputWait(
+                    self.input_generation,
+                    r4os.abi.io_wait_forever,
+                    &observed_generation,
+                );
+                self.input_generation = observed_generation;
+                switch (wait_result) {
+                    r4os.abi.console_input_wait_ready,
+                    r4os.abi.console_input_wait_timeout,
+                    => continue,
+                    r4os.abi.console_input_wait_error_closed => {
+                        self.exit_requested = true;
+                        return null;
+                    },
+                    r4os.abi.console_input_wait_error_unsupported => {
+                        self.input_wait_supported = false;
+                        continue;
+                    },
+                    else => self.input_wait_supported = false,
+                }
+            }
+
+            const value = self.sys.readKey();
+            if (value != 0) return value;
+            if (self.sys.programShouldClose()) {
+                self.exit_requested = true;
+                return null;
+            }
+            self.sys.taskYield();
+        }
     }
 
     fn write(self: *TerminalState, value: []const u8) void {
@@ -842,7 +913,11 @@ const TerminalState = struct {
         }
         if (arg.len != 0) return self.fail("Usage: PAUSE");
         self.write("Press any key to continue . . .");
-        while (self.sys.readKey() == 0) self.sys.taskYield();
+        _ = self.readInputByteBlocking() orelse {
+            self.write("\r\n");
+            self.setErrorlevel(0);
+            return .ok;
+        };
         self.write("\r\n");
         self.setErrorlevel(0);
         return .ok;
@@ -1414,6 +1489,7 @@ pub fn r4_app_main(r4_app: *r4os.App) i32 {
         .builtintest => runBuiltinSelftest(sys, dev),
         .launchtest => runLaunchSelftest(sys, dev),
         .batchtest => runBatchSelftest(sys, dev),
+        .outputtest => runOutputTest(sys),
     };
 }
 
@@ -1505,9 +1581,136 @@ fn runSelftest(sys: r4os.r4sys.Context, dev: r4os.r4dev.Context) i32 {
         return 1;
     }
     if (runBuiltinSelftest(sys, dev) != 0) return 1;
+    if (!runOutputTranscriptSelftest(sys, dev)) return 1;
     sys.println("Terminal userland selftest: OK");
     sys.println("Terminal loop: userland session/prompt/environment/input/history/built-ins/external launch/batch/redirection");
     return 0;
+}
+
+fn runOutputTest(sys: r4os.r4sys.Context) i32 {
+    var iteration: u32 = 0;
+    while (iteration < OUTPUT_TEST_ITERATIONS) : (iteration += 1) sys.write(output_test_chunk);
+    return 0;
+}
+
+fn runOutputTranscriptSelftest(sys: r4os.r4sys.Context, dev: r4os.r4dev.Context) bool {
+    const before = dev.performanceInput() orelse {
+        sys.println("Terminal output sharing: performance counters unavailable");
+        return false;
+    };
+    const path = "C:\\R4OS\\SOFTWARE\\TERMINAL\\TERMINAL.R4X";
+    const args: [*:0]const u8 = "/OUTPUTTEST";
+    const resources = r4os.Resources{ .sys = sys };
+    var process = switch (resources.spawn(.{ .ptr = path, .len = path.len }, args, .console)) {
+        .process => |handle| handle,
+        .failure => |raw| {
+            sys.write("Terminal output sharing: spawn failed ");
+            sys.printI32(raw);
+            sys.write("\r\n");
+            return false;
+        },
+    };
+    defer {
+        if (process.valid()) {
+            _ = process.kill();
+            _ = process.wait(r4os.time_contract.timeoutForever());
+        }
+    }
+
+    const completion = switch (process.waitReady(r4os.time_contract.timeoutFinite(.{ .nanoseconds = 10_000_000_000 }))) {
+        .ready => |value| value,
+        .would_block, .timed_out => {
+            sys.println("Terminal output sharing: child wait timed out");
+            return false;
+        },
+        .failure => |raw| {
+            sys.write("Terminal output sharing: child wait failed ");
+            sys.printI32(raw);
+            sys.write("\r\n");
+            return false;
+        },
+    };
+
+    const expected_bytes: u32 = @intCast(output_test_chunk.len * OUTPUT_TEST_ITERATIONS);
+    if (completion.exit_code != 0 or completion.output_length != expected_bytes or
+        completion.output_revision == 0 or completion.output_revision > OUTPUT_TEST_ITERATIONS + 1)
+    {
+        sys.println("Terminal output sharing: completion metadata mismatch");
+        return false;
+    }
+
+    var read_buffer: [512]u8 = undefined;
+    var offset: u32 = 0;
+    while (offset < expected_bytes) {
+        const remaining: usize = @intCast(expected_bytes - offset);
+        const capacity = @min(remaining, read_buffer.len);
+        const count = switch (process.completionRead(offset, read_buffer[0..capacity])) {
+            .bytes => |value| value,
+            .would_block => {
+                sys.println("Terminal output sharing: completed transcript would block");
+                return false;
+            },
+            .failure => |raw| {
+                sys.write("Terminal output sharing: completion read failed ");
+                sys.printI32(raw);
+                sys.write("\r\n");
+                return false;
+            },
+        };
+        if (count == 0 or count > capacity) {
+            sys.println("Terminal output sharing: short completion transcript");
+            return false;
+        }
+        var i: usize = 0;
+        while (i < count) : (i += 1) {
+            const expected_index = (@as(usize, offset) + i) % output_test_chunk.len;
+            if (read_buffer[i] != output_test_chunk[expected_index]) {
+                sys.println("Terminal output sharing: completion bytes differ");
+                return false;
+            }
+        }
+        offset += count;
+    }
+
+    switch (process.reap()) {
+        .exited => |exit_code| if (exit_code != 0) {
+            sys.println("Terminal output sharing: child exit mismatch");
+            return false;
+        },
+        else => {
+            sys.println("Terminal output sharing: child reap failed");
+            return false;
+        },
+    }
+
+    const after = dev.performanceInput() orelse {
+        sys.println("Terminal output sharing: final performance counters unavailable");
+        return false;
+    };
+    const write_calls = after.console_output_write_calls - before.console_output_write_calls;
+    const source_bytes = after.console_output_source_bytes - before.console_output_source_bytes;
+    const visible_bytes = after.console_output_visible_append_bytes - before.console_output_visible_append_bytes;
+    const capture_bytes = after.console_output_capture_append_bytes - before.console_output_capture_append_bytes;
+    const shared_bytes = after.console_output_shared_bytes - before.console_output_shared_bytes;
+    const revision_batches = after.console_output_revision_batches - before.console_output_revision_batches;
+    const desktop_signals = after.console_output_desktop_signals - before.console_output_desktop_signals;
+    if (source_bytes < expected_bytes or visible_bytes < expected_bytes or capture_bytes < expected_bytes or
+        shared_bytes < expected_bytes or write_calls == 0 or revision_batches > write_calls * 2 or
+        desktop_signals > write_calls)
+    {
+        sys.println("Terminal output sharing: performance counter mismatch");
+        return false;
+    }
+    sys.write("Terminal output sharing: OK bytes=");
+    sys.printU64(expected_bytes);
+    sys.write(" writes=");
+    sys.printU64(write_calls);
+    sys.write(" revisions=");
+    sys.printU64(revision_batches);
+    sys.write(" wakes=");
+    sys.printU64(desktop_signals);
+    sys.write("\r\n");
+    return true;
 }
 
 fn runBuiltinSelftest(sys: r4os.r4sys.Context, dev: r4os.r4dev.Context) i32 {
@@ -1700,6 +1903,7 @@ fn modeFromArgs(args_raw: []const u8) Mode {
     if (equalsIgnoreCase(args, "/BUILTINTEST") or equalsIgnoreCase(args, "--BUILTINTEST")) return .builtintest;
     if (equalsIgnoreCase(args, "/LAUNCHTEST") or equalsIgnoreCase(args, "--LAUNCHTEST")) return .launchtest;
     if (equalsIgnoreCase(args, "/BATCHTEST") or equalsIgnoreCase(args, "--BATCHTEST")) return .batchtest;
+    if (equalsIgnoreCase(args, "/OUTPUTTEST") or equalsIgnoreCase(args, "--OUTPUTTEST")) return .outputtest;
     return .help;
 }
 

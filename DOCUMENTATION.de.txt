@@ -5,15 +5,19 @@ TERMINAL.R4X ist R4OS' DOS-artige Terminal-/Shell-Anwendung. Sie laeuft als
 normales R4X-Programm im Userland und ist sowohl fuer Terminal Window als auch
 fuer Terminal Mode der produktive Shell-Pfad.
 
-Stand 0.59.12:
+Stand 0.69.67:
 - Projektstruktur seit 0.51.20:
   `build.zig` baut TERMINAL.R4X als eigenes SDK-Projekt,
   `build.zig.zon` bindet `r4os_sdk`, und `module.R4MF` beschreibt Artefakt,
   Zielpfad, die R4STD-DATE_V1-/TIME_V1-Imports und den R4XStart-Contract.
 - TERMINAL.R4X besitzt den produktiven Userland-Hauptloop fuer die Shell.
-- TERMINAL.R4X liest Tastaturereignisse ueber R4SYS, normalisiert sichtbare
-  Eingabe, verwaltet History, Prompt, Environment, PATH, SHELL und ERRORLEVEL
-  selbst.
+- TERMINAL.R4X liest vorhandene Konsoleneingabe gebuendelt. Bei leerer Queue
+  blockiert der Haupttask generationengebunden bis Eingabe oder Close
+  signalisiert wird; `PAUSE` benutzt denselben gepufferten Leser. Der alte
+  `readKey`-/Yield-Poll bleibt nur als Kompatibilitaetsfallback fuer Provider
+  ohne den optionalen Wait-Slot erhalten.
+- TERMINAL.R4X normalisiert sichtbare Eingabe und verwaltet History, Prompt,
+  Environment, PATH, SHELL und ERRORLEVEL selbst.
 - TERMINAL.R4X liest keine COMMAND.R4S, TERMINAL.R4S oder Designwerte aus
   CONFIG.R4S oder DESKTOP.R4S.
 - Wenn Terminal die vom Bootloader ausgewaehlte Shell ist, meldet es
@@ -45,7 +49,11 @@ Stand 0.59.12:
 - Nicht migrierte Batch-/Stream-Funktionen werden sichtbar als nicht migriert
   gemeldet, statt still in eine alte Kernel-Runtime zurueckzufallen.
 - `TERMINAL.R4X /SELFTEST`, `/BUILTINTEST`, `/LAUNCHTEST` und `/BATCHTEST`
-  bilden die automatische Terminal-Abnahme.
+  bilden die automatische Terminal-Abnahme. Der SELFTEST startet zusaetzlich
+  einen textreichen Kindprozess und liest dessen unveraendertes
+  Completiontranscript vor dem Reap. Telemetrie belegt dabei gemeinsam
+  referenzierte sichtbare/private Bytes sowie batchweise Revisionen und
+  Desktop-Wakes.
 - Externe GUI-Module mit einem reinen Konsolenmodus koennen `/CONSOLE` als
   expliziten Launch-Hinweis erhalten. Die etablierten Utility-Schalter
   `/EXPORT` und `/RDPTRACE` werden kompatibel ebenfalls mit Console-Policy
@@ -72,12 +80,21 @@ SSH-Remote-Kommandos verwenden; SSHD muss dafuer keinen eigenen
 Befehlsinterpreter enthalten.
 Seit 0.59.12 bleibt die Ausgabe von GUI-klassifizierten Exportwerkzeugen mit
 `/CONSOLE` ownergebunden in der aufrufenden Terminal- oder SSH-Sitzung.
+Seit 0.69.67 schlafen leere Terminal- und PAUSE-Waits auf dem
+generationengebundenen Konsoleneingabeereignis. Externe Konsolenprogramme
+schreiben Text ueber den gebuendelten R4SYS-Pfad; sichtbares Hosttranscript und
+Completionretention referenzieren dieselben versiegelten Quellbloecke.
 
 Einzelbuild:
 
-    cd Code\System\Software\Terminal
-    ..\..\..\DevTools\Zig\zig.exe build
+    cd Repositories\Apps\Terminal
+    Build.bat
+
+Unter Linux:
+
+    cd Repositories/Apps/Terminal
+    ./Build.sh
 
 Ergebnis:
 
-    Code\System\Software\Terminal\zig-out\TERMINAL.R4X
+    Artifacts/Modules/Terminal/TERMINAL.R4X
