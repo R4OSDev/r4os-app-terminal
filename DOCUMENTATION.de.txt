@@ -38,6 +38,10 @@ Stand 0.69.67:
   diesen Pfad fuer nicht-interaktive SSH-Exec-Requests.
 - Einfache Built-ins, externe Programmstarts, einfache Batch-Dateien und
   grundlegende Redirection laufen ohne produktive Kernel-Executor-Bruecke.
+- `WAITFILE <Millisekunden> <Pfad>` wartet in begrenzten, schlafenden
+  Intervallen auf eine Datei und liefert bei Ablauf einen sichtbaren Fehler.
+  Der SMP4-Test nutzt damit den frisch erzeugten Desktop-Abschlussmarker statt
+  einer zeitlich geratenen Pause; die Obergrenze bleibt zehn Minuten Gastzeit.
 - Laufwerkswechsel wie `D:` sowie `CD`/`CHDIR` laufen ueber den
   validierten Terminal-CWD: Nicht vorhandene Laufwerke oder Verzeichnisse
   aendern den Prompt nicht.

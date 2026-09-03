@@ -395,6 +395,7 @@ const TerminalState = struct {
         if (equalsIgnoreCase(name, "CLS")) return self.clsCommand(args);
         if (equalsIgnoreCase(name, "PAUSE")) return self.pauseCommand(args);
         if (equalsIgnoreCase(name, "SLEEP")) return self.sleepCommand(args);
+        if (equalsIgnoreCase(name, "WAITFILE")) return self.waitFileCommand(args);
         if (equalsIgnoreCase(name, "COLOR")) return self.colorCommand(args);
         if (equalsIgnoreCase(name, "DATE")) return self.dateCommand(args);
         if (equalsIgnoreCase(name, "TIME")) return self.timeCommand(args);
@@ -934,6 +935,35 @@ const TerminalState = struct {
         if (ms > 10 * 60 * 1000) return self.fail("SLEEP maximum is 600000 milliseconds");
         const ticks = self.sys.ticksFromMilliseconds(ms);
         if (ticks != 0) self.sys.sleepTicks(ticks);
+        self.setErrorlevel(0);
+        return .ok;
+    }
+
+    fn waitFileCommand(self: *TerminalState, arg_raw: []const u8) BuiltinResult {
+        const arg = trim(arg_raw);
+        if (equalsIgnoreCase(arg, "/?")) {
+            self.println("Usage: WAITFILE timeout-milliseconds path");
+            self.setErrorlevel(0);
+            return .ok;
+        }
+        const parsed = splitCommand(arg);
+        const timeout_ms = parseU64Decimal(parsed.name) orelse
+            return self.fail("Usage: WAITFILE timeout-milliseconds path");
+        const path = trim(parsed.args);
+        if (path.len == 0 or timeout_ms > 10 * 60 * 1000) {
+            return self.fail("WAITFILE needs a path and at most 600000 milliseconds");
+        }
+        var path_z: [PATH_MAX:0]u8 = .{0} ** PATH_MAX;
+        if (!copyCommandZ(path_z[0..], path)) return self.fail("WAITFILE path too long");
+
+        var remaining_ms = timeout_ms;
+        while (!self.sys.exists(&path_z)) {
+            if (remaining_ms == 0) return self.fail("WAITFILE timed out");
+            const slice_ms = @min(remaining_ms, @as(u64, 1000));
+            const ticks = self.sys.ticksFromMilliseconds(slice_ms);
+            if (ticks != 0) self.sys.sleepTicks(ticks);
+            remaining_ms -= slice_ms;
+        }
         self.setErrorlevel(0);
         return .ok;
     }
@@ -1732,6 +1762,8 @@ fn runBuiltinSelftest(sys: r4os.r4sys.Context, dev: r4os.r4dev.Context) i32 {
     ok = expectBuiltin(&state, "CD ..") and ok;
     ok = expectCwd(&state, "C:\\") and ok;
     ok = writeFixture(sys, "C:\\CMDTEST\\CMDU.TXT", "TERMINAL USERLAND\r\n") and ok;
+    ok = expectBuiltin(&state, "WAITFILE 0 C:\\CMDTEST\\CMDU.TXT") and ok;
+    ok = expectFailure(&state, "WAITFILE 0 C:\\CMDTEST\\MISSING.TXT") and ok;
     ok = writeFixture(sys, "C:\\CMDTEST\\SORT.TXT", "zeta\r\nalpha\r\nBeta\r\n") and ok;
     ok = expectBuiltin(&state, "CLS") and ok;
     ok = expectBuiltin(&state, "VERIFY") and ok;

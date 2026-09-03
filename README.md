@@ -4,7 +4,7 @@
 
 ## Package
 
-- Version: `0.1.7`
+- Version: `0.1.8`
 - Image target: `/R4OS/SOFTWARE/TERMINAL/TERMINAL.R4X`
 - Image scope: `slim`
 - Canonical project manifest: `module.R4MF`
