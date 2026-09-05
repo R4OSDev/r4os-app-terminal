@@ -98,6 +98,7 @@ const TerminalState = struct {
 
     fn run(self: *TerminalState, run_autoexec: bool) i32 {
         self.initializeSession();
+        self.printRecoveryBanner();
         if (run_autoexec) self.runAutoexec();
         self.printPrompt();
         _ = self.sys.bootReady();
@@ -164,6 +165,24 @@ const TerminalState = struct {
                     }
                 },
             }
+        }
+    }
+
+    fn printRecoveryBanner(self: *TerminalState) void {
+        if (!r4os.runtime_context.isRecovery(&self.sys)) return;
+        var buffer: [512]u8 = undefined;
+        self.write("R4OS Recovery ");
+        self.println(self.releaseVersion(&buffer));
+        const count = self.sys.fileRead("C:\\R4OS\\CONFIG\\BOOTMED.TXT", &buffer);
+        if (count > 0) self.write(buffer[0..@intCast(count)]);
+        self.write("Mounted drives (also /<letter>/ in SFTP and FTP):\r\n");
+        for (0..26) |index| {
+            const info = self.sys.driveInfo(@intCast(index)) orelse continue;
+            if (info.mounted == 0) continue;
+            self.putc(info.letter);
+            self.write(":  ");
+            self.write(spanZFixed(&info.name));
+            self.write(if (info.role == r4os.abi.drive_role_ram) " [running RAM]\r\n" else " [offline volume]\r\n");
         }
     }
 

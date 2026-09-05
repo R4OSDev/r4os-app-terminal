@@ -102,3 +102,12 @@ Unter Linux:
 Ergebnis:
 
     Artifacts/Modules/Terminal/TERMINAL.R4X
+
+0.76.7: Recovery-Sitzungsanzeige
+------------------------------
+Interaktive Sitzungen erkennen die gestartete Recovery-RAM-Laufzeit ueber
+das SDK und zeigen deren Version, die aus der Limine-Identitaet ermittelte
+Bootmediumbeschreibung und die aktuellen gemeinsamen Laufwerke. Dies gilt
+fuer den lokalen Menuehost und SSH. /C-Befehle erhalten keinen Banner.
+BOOTMED.TXT entsteht beim Recovery-Boot im RAM; Offline-Installationen
+liefern weder den Banner noch die gestarteten Werkzeuge.
