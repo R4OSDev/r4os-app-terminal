@@ -1152,7 +1152,8 @@ const TerminalState = struct {
         while (true) : (index += 1) {
             @memset(entry_buf[0..], 0);
             const rc = self.sys.dirEntry(path, index, entry_buf[0..]);
-            if (rc < 0) break;
+            if (rc == r4os.r4sys.dir_entry_result_end) break;
+            if (rc < 0) return self.fail("Directory read failed; listing incomplete");
             const full = spanZSlice(entry_buf[0..]);
             const name = baseName(full);
             if (name.len == 0) continue;
