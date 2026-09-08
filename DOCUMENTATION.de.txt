@@ -111,3 +111,22 @@ Bootmediumbeschreibung und die aktuellen gemeinsamen Laufwerke. Dies gilt
 fuer den lokalen Menuehost und SSH. /C-Befehle erhalten keinen Banner.
 BOOTMED.TXT entsteht beim Recovery-Boot im RAM; Offline-Installationen
 liefern weder den Banner noch die gestarteten Werkzeuge.
+
+
+Arbeitsverzeichnis ab 0.78.67
+-----------------------------
+Kernel0.1.130 fuehrt CWD als Sicht auf Laufwerk und Verzeichnis der jeweiligen
+Programminstanz. Die vorhandenen env_get/env_set-Aufrufe lesen beziehungsweise
+aendern diesen Kontext. Vor einer Aenderung werden absoluter Pfad, Verzeichnis
+und vollstaendige Laenge bestaetigt; fehlgeschlagene Wechsel aendern nichts.
+Lesen, Veroeffentlichung und Vererbung kopieren den Kontext unter dem kurzen
+Programmzustandsbesitzer, Dateisystemarbeit erfolgt vorher ausserhalb davon.
+
+Terminal0.1.12 uebernimmt beim Start das geerbte CWD und aktualisiert seinen
+Prompt erst nach Bestaetigung durch R4SYS. Relative Dateibefehle, Redirection
+und Kindstarts verwenden damit denselben Kontext. Aenderungen eines Kindes
+bleiben lokal. CD C:relativ bezieht sich auf das aktuelle C-Verzeichnis;
+Laufwerkswechsel waehlen weiterhin die Wurzel. VOL ohne Operand zeigt das
+aktuelle Laufwerk. Ein kurzer SMP4-Lauf prueft private gleichnamige Dateien,
+relative Operationen, Umleitung, zwei Kindstartformen, Fehlwechsel und VOL
+auf zwei lokalen Volumes. Keine zusaetzlichen kanonischen Testdateien.

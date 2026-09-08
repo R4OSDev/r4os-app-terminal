@@ -19,7 +19,6 @@ const version_unknown = "unknown";
 const default_path = "C:\\R4OS\\SOFTWARE\\TERMINAL;C:\\R4OS\\SOFTWARE\\TERMINAL\\DIAG";
 const default_prompt = "$P$G";
 const default_shell = "C:\\R4OS\\SOFTWARE\\TERMINAL\\TERMINAL.R4X";
-const default_cwd = "C:\\";
 const default_temp = "C:\\TEMP";
 const environment_registry_key = "SYSTEM\\Environment";
 const path_registry_value = "PATH";
@@ -97,7 +96,7 @@ const TerminalState = struct {
     input_wait_supported: bool = true,
 
     fn run(self: *TerminalState, run_autoexec: bool) i32 {
-        self.initializeSession();
+        if (!self.initializeSession()) return 1;
         self.printRecoveryBanner();
         if (run_autoexec) self.runAutoexec();
         self.printPrompt();
@@ -186,7 +185,7 @@ const TerminalState = struct {
         }
     }
 
-    fn initializeSession(self: *TerminalState) void {
+    fn initializeSession(self: *TerminalState) bool {
         self.echo_on = true;
         self.errorlevel = 0;
         self.redirect_active = false;
@@ -203,10 +202,16 @@ const TerminalState = struct {
         self.loadStartupPersistentPath();
         _ = self.setPrompt(default_prompt);
         _ = self.setShell(default_shell);
-        _ = self.setCwd(default_cwd);
+        const cwd_read = self.sys.envGet("CWD", self.cwd_env[0..]);
+        if (cwd_read < 3 or cwd_read > self.cwd_env.len) {
+            self.println("Working directory unavailable");
+            return false;
+        }
+        self.cwd_len = @intCast(cwd_read);
         _ = self.setTemp(default_temp);
         _ = self.setBlaster("");
         self.syncProcessEnvironment();
+        return true;
     }
 
     fn readInputByteBlocking(self: *TerminalState) ?u8 {
@@ -893,8 +898,7 @@ const TerminalState = struct {
         }
         var path_buf: [PATH_MAX]u8 = undefined;
         const resolved = self.resolveDirectoryArgument(arg, path_buf[0..]) orelse return self.fail("Path not found");
-        if (!self.directoryReady(resolved)) return self.fail("Path not found");
-        if (!self.setCwd(resolved)) return self.fail("Path too long");
+        if (!self.setCwd(resolved)) return self.fail("Cannot change directory");
         self.setErrorlevel(0);
         return .ok;
     }
@@ -1039,7 +1043,7 @@ const TerminalState = struct {
 
     fn volCommand(self: *TerminalState, arg_raw: []const u8) BuiltinResult {
         const arg = trim(arg_raw);
-        const drive_index: u32 = if (arg.len == 0) 2 else driveIndexFromArg(arg) orelse return self.fail("Invalid drive");
+        const drive_index: u32 = if (arg.len == 0) currentDriveLetter(self.cwd_env[0..self.cwd_len]) - 'A' else driveIndexFromArg(arg) orelse return self.fail("Invalid drive");
         const info = self.sys.driveInfo(drive_index) orelse return self.fail("Drive not ready");
         if (info.mounted == 0) return self.fail("Drive not ready");
         self.write(" Volume in drive ");
@@ -1385,16 +1389,16 @@ const TerminalState = struct {
     }
 
     fn setCwd(self: *TerminalState, value: []const u8) bool {
-        if (!copyText(self.cwd_env[0..], &self.cwd_len, value)) return false;
-        self.syncEnvValue("CWD", self.cwd_env[0..self.cwd_len]);
-        return true;
+        if (value.len > self.cwd_env.len) return false;
+        // Publish the prompt only after the kernel confirms the same context.
+        if (self.sys.envSet("CWD", value) != 0) return false;
+        return copyText(self.cwd_env[0..], &self.cwd_len, value);
     }
 
     fn changeDriveCommand(self: *TerminalState, letter: u8) BuiltinResult {
         var root_buf: [4]u8 = undefined;
         const root = driveRootPath(letter, root_buf[0..]) orelse return self.fail("Invalid drive");
-        if (!self.directoryReady(root)) return self.fail("Drive not ready");
-        if (!self.setCwd(root)) return self.fail("Path too long");
+        if (!self.setCwd(root)) return self.fail("Drive not ready");
         self.setErrorlevel(0);
         return .ok;
     }
@@ -1431,7 +1435,6 @@ const TerminalState = struct {
         self.syncEnvValue("PATH", self.path_env[0..self.path_len]);
         self.syncEnvValue("PROMPT", self.prompt_env[0..self.prompt_len]);
         self.syncEnvValue("SHELL", self.shell_env[0..self.shell_len]);
-        self.syncEnvValue("CWD", self.cwd_env[0..self.cwd_len]);
         self.syncEnvValue("TEMP", self.temp_env[0..self.temp_len]);
         self.syncEnvValue("BLASTER", self.blaster_env[0..self.blaster_len]);
     }
@@ -1550,7 +1553,7 @@ fn runPrimary(sys: r4os.r4sys.Context, dev: r4os.r4dev.Context, run_autoexec: bo
 
 fn runCommand(sys: r4os.r4sys.Context, dev: r4os.r4dev.Context, command: []const u8) i32 {
     var state = TerminalState{ .sys = sys, .dev = dev };
-    state.initializeSession();
+    if (!state.initializeSession()) return 1;
     state.executeLine(command);
     return state.errorlevel;
 }
@@ -1588,7 +1591,7 @@ fn runSelftest(sys: r4os.r4sys.Context, dev: r4os.r4dev.Context) i32 {
         return 1;
     }
     var state = TerminalState{ .sys = sys, .dev = dev };
-    state.initializeSession();
+    if (!state.initializeSession()) return 1;
     var version_data: [VERSION_FILE_MAX]u8 = undefined;
     if (equalsIgnoreCase(state.releaseVersion(version_data[0..]), version_unknown)) {
         sys.println("Terminal selftest: VERSION.R4S not readable");
@@ -1765,7 +1768,7 @@ fn runOutputTranscriptSelftest(sys: r4os.r4sys.Context, dev: r4os.r4dev.Context)
 
 fn runBuiltinSelftest(sys: r4os.r4sys.Context, dev: r4os.r4dev.Context) i32 {
     var state = TerminalState{ .sys = sys, .dev = dev };
-    state.initializeSession();
+    if (!state.initializeSession()) return 1;
     var ok = true;
 
     _ = sys.fileDelete("C:\\CMDTEST\\CMDU.TXT");
@@ -1828,7 +1831,7 @@ fn runBuiltinSelftest(sys: r4os.r4sys.Context, dev: r4os.r4dev.Context) i32 {
 
 fn runLaunchSelftest(sys: r4os.r4sys.Context, dev: r4os.r4dev.Context) i32 {
     var state = TerminalState{ .sys = sys, .dev = dev };
-    state.initializeSession();
+    if (!state.initializeSession()) return 1;
     var ok = true;
 
     ok = expectProgramResolution(&state, "BOOTINFO", 1) and ok;
@@ -1847,7 +1850,7 @@ fn runLaunchSelftest(sys: r4os.r4sys.Context, dev: r4os.r4dev.Context) i32 {
 
 fn runBatchSelftest(sys: r4os.r4sys.Context, dev: r4os.r4dev.Context) i32 {
     var state = TerminalState{ .sys = sys, .dev = dev };
-    state.initializeSession();
+    if (!state.initializeSession()) return 1;
     var ok = true;
 
     _ = sys.fileDelete("C:\\CMDTEST\\REDIR.TXT");
@@ -2083,8 +2086,9 @@ fn normalizeDosPath(cwd_raw: []const u8, arg_raw: []const u8, out: []u8) ?[]cons
         drive = upper(arg[0]);
         if (drive < 'A' or drive > 'Z') return null;
         rest = arg[2..];
-        absolute = true;
-        if (rest.len != 0 and isPathSeparator(rest[0])) rest = skipLeadingSeparators(rest);
+        const rooted = rest.len != 0 and isPathSeparator(rest[0]);
+        absolute = rooted or rest.len == 0 or drive != currentDriveLetter(cwd_raw);
+        if (rooted) rest = skipLeadingSeparators(rest);
     } else if (isPathSeparator(arg[0])) {
         absolute = true;
         rest = skipLeadingSeparators(arg);
