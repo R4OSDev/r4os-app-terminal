@@ -4,13 +4,17 @@
 
 ## Package
 
-- Version: `0.1.8`
+- Version: `0.1.13`
 - Image target: `/R4OS/SOFTWARE/TERMINAL/TERMINAL.R4X`
 - Image scope: `slim`
 - Canonical project manifest: `module.R4MF`
 
 The manifest is the single source of truth for the artifact, imports, image
 target, and package metadata.
+
+Console input accepts CR, LF and CRLF as one line submission, including when
+CR and LF arrive in separate reads. Desktop Enter and pasted commands use
+the same input path as SSH; editing and history keys retain their values.
 
 ## Build
 

@@ -1,5 +1,6 @@
 const r4os = @import("r4os");
 const r4std = @import("r4std");
+const input_line = @import("input_line.zig");
 
 const INPUT_MAX: usize = 4096;
 const HISTORY_DEPTH: usize = 16;
@@ -94,6 +95,7 @@ const TerminalState = struct {
     input_generation: u64 = 0,
     input_bulk_supported: bool = true,
     input_wait_supported: bool = true,
+    input_line_normalizer: input_line.Normalizer = .{},
 
     fn run(self: *TerminalState, run_autoexec: bool) i32 {
         if (!self.initializeSession()) return 1;
@@ -219,7 +221,8 @@ const TerminalState = struct {
             if (self.input_buffer_pos < self.input_buffer_len) {
                 const value = self.input_buffer[self.input_buffer_pos];
                 self.input_buffer_pos += 1;
-                return value;
+                if (self.input_line_normalizer.accept(value)) |byte| return byte;
+                continue;
             }
             self.input_buffer_pos = 0;
             self.input_buffer_len = 0;
@@ -263,7 +266,10 @@ const TerminalState = struct {
             }
 
             const value = self.sys.readKey();
-            if (value != 0) return value;
+            if (value != 0) {
+                if (self.input_line_normalizer.accept(value)) |byte| return byte;
+                continue;
+            }
             if (self.sys.programShouldClose()) {
                 self.exit_requested = true;
                 return null;
@@ -1570,6 +1576,10 @@ fn runHelp(sys: r4os.r4sys.Context) i32 {
 
 fn runSelftest(sys: r4os.r4sys.Context, dev: r4os.r4dev.Context) i32 {
     var ok = true;
+    if (!input_line.checkExamples()) {
+        sys.println("Terminal input CR/LF/CRLF selftest: FAILED");
+        ok = false;
+    } else sys.println("Terminal input CR/LF/CRLF selftest: OK");
     if (!sys.contractValid()) {
         sys.println("Terminal selftest: API header invalid");
         ok = false;
