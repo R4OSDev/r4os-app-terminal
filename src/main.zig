@@ -1844,10 +1844,10 @@ fn runLaunchSelftest(sys: r4os.r4sys.Context, dev: r4os.r4dev.Context) i32 {
     if (!state.initializeSession()) return 1;
     var ok = true;
 
-    ok = expectProgramResolution(&state, "BOOTINFO", 1) and ok;
-    ok = expectProgramResolution(&state, "BOOTINFO.R4X", 1) and ok;
-    ok = expectProgramResolution(&state, "C:\\R4OS\\SOFTWARE\\TERMINAL\\BOOTINFO.R4X", 1) and ok;
-    ok = expectProgramResolution(&state, "R4OS\\SOFTWARE\\TERMINAL\\BOOTINFO.R4X", 1) and ok;
+    ok = expectProgramResolution(&state, "SPECTRA", 1) and ok;
+    ok = expectProgramResolution(&state, "SPECTRA.R4X", 1) and ok;
+    ok = expectProgramResolution(&state, "C:\\R4OS\\SOFTWARE\\TERMINAL\\DIAG\\SPECTRA.R4X", 1) and ok;
+    ok = expectProgramResolution(&state, "R4OS\\SOFTWARE\\TERMINAL\\DIAG\\SPECTRA.R4X", 1) and ok;
     ok = expectCommandFailure(&state, "NO_SUCH_COMMAND") and ok;
 
     if (!ok) {
@@ -1883,11 +1883,11 @@ fn runBatchSelftest(sys: r4os.r4sys.Context, dev: r4os.r4dev.Context) i32 {
     ok = checkBatchStep(sys, "pipe rejection", state.errorlevel != 0) and ok;
     state.executeLine("SORT < C:\\CMDTEST\\REDIR.TXT");
     ok = checkBatchStep(sys, "stdin rejection", state.errorlevel != 0) and ok;
-    state.executeLine("BOOTINFO > C:\\CMDTEST\\BOOTINFO.TXT");
+    state.executeLine("SPECTRA METRICS BOOT > C:\\CMDTEST\\SPECTRA.TXT");
     ok = checkBatchStep(sys, "external redirection rejection", state.errorlevel != 0) and ok;
     ok = checkBatchStep(sys, "batch control rejection", expectFailure(&state, "GOTO END")) and ok;
 
-    _ = sys.fileDelete("C:\\CMDTEST\\BOOTINFO.TXT");
+    _ = sys.fileDelete("C:\\CMDTEST\\SPECTRA.TXT");
     _ = sys.fileDelete("C:\\CMDTEST\\BATCH.OUT");
     _ = sys.fileDelete("C:\\CMDTEST\\BATCHT.BAT");
     _ = sys.fileDelete("C:\\CMDTEST\\REDIR2.TXT");
