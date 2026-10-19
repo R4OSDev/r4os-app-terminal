@@ -666,19 +666,30 @@ const TerminalState = struct {
     fn poweroffCommand(self: *TerminalState, args: []const u8) BuiltinResult {
         if (trim(args).len != 0) return self.fail("Usage: POWEROFF");
         self.println("System poweroff.");
-        self.sys.systemPoweroff();
+        return self.powerTransition(r4os.abi.power_transition_action_poweroff);
     }
 
     fn rebootCommand(self: *TerminalState, args: []const u8) BuiltinResult {
         if (trim(args).len != 0) return self.fail("Usage: REBOOT");
         self.println("System reboot.");
-        self.sys.systemReboot();
+        return self.powerTransition(r4os.abi.power_transition_action_reboot);
     }
 
     fn haltCommand(self: *TerminalState, args: []const u8) BuiltinResult {
         if (trim(args).len != 0) return self.fail("Usage: HALT");
         self.println("System halt.");
-        self.sys.systemHalt();
+        return self.powerTransition(r4os.abi.power_transition_action_halt);
+    }
+
+    fn powerTransition(self: *TerminalState, action: u32) BuiltinResult {
+        // Success does not return. A refused hardware return must leave the
+        // prompt usable, with its exact error rather than an endless yield.
+        const rc = self.sys.systemPowerTransition(action, self.sys.ticksFromMilliseconds(5000));
+        self.write("System transition refused (");
+        self.printI32(rc);
+        self.println("). CPU requests may still be retained.");
+        self.setErrorlevel(1);
+        return .failed;
     }
 
     fn echoCommand(self: *TerminalState, arg_raw: []const u8) BuiltinResult {
