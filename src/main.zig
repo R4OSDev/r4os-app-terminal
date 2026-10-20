@@ -41,6 +41,9 @@ const Mode = enum {
     outputtest,
     inputtest,
     inputprobe,
+    texttest,
+    textprobe,
+    textclose,
 };
 
 const BuiltinResult = enum {
@@ -1542,6 +1545,9 @@ pub fn r4_app_main(r4_app: *r4os.App) i32 {
         .outputtest => runOutputTest(sys),
         .inputtest => runInputSelftest(sys, true),
         .inputprobe => runInputProbe(sys, dev),
+        .texttest => @import("console_text_test.zig").run(sys),
+        .textprobe => @import("console_text_test.zig").probe(sys),
+        .textclose => @import("console_text_test.zig").closeProbe(sys),
     };
 }
 
@@ -1969,6 +1975,9 @@ fn modeFromArgs(args_raw: []const u8) Mode {
     if (equalsIgnoreCase(args, "/OUTPUTTEST") or equalsIgnoreCase(args, "--OUTPUTTEST")) return .outputtest;
     if (equalsIgnoreCase(args, "/INPUTTEST")) return .inputtest;
     if (equalsIgnoreCase(args, "/INPUTPROBE")) return .inputprobe;
+    if (equalsIgnoreCase(args, "/TEXTTEST")) return .texttest;
+    if (equalsIgnoreCase(args, "/TEXTPROBE")) return .textprobe;
+    if (equalsIgnoreCase(args, "/TEXTCLOSE")) return .textclose;
     return .help;
 }
 
