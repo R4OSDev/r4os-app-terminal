@@ -74,3 +74,9 @@ Recovery carry the same correction; no broad shell or filesystem profile.
 ## Console input
 
 Typed console input uses R4DESK16 and R4STD CODEC_V1. Unicode scalars and logical keys remain separate; SSH stream bytes retain a per-instance UTF-8 decoder across reads. Backspace removes a complete scalar, and bounded history entries end at scalar boundaries. `/INPUTTEST` runs an isolated console child through full-queue, stale-handle, partial UTF-8 and real command/history checks, then starts the explicit Desktop input diagnostic through the process API. Run this combined check in standalone Terminal Mode with no other Desktop owner. `/SELFTEST` includes the console child without starting another Desktop. Grapheme editing and console rendering are separate roadmap work.
+
+0.85.44: The command line removes complete Unicode17 extended graphemes
+and history clips only at those boundaries. Erasure still counts the
+existing per-scalar console cells; shaping and terminal width negotiation
+are separate. /GRAPHEMETEST covers combining/flag/ZWJ boundaries and the real private
+console-host command loop/history with typed and byte-stream ZWJ deletion.

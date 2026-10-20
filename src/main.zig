@@ -42,6 +42,7 @@ const Mode = enum {
     inputtest,
     inputprobe,
     texttest,
+    graphemetest,
     textprobe,
     textclose,
 };
@@ -134,8 +135,10 @@ const TerminalState = struct {
                 },
                 0x08 => {
                     if (len > 0) {
-                        len = input_line.removeLast(input[0..len]);
-                        self.putc(0x08);
+                        const next_len = input_line.removeLast(input[0..len]);
+                        const cells = input_line.erasedCells(input[next_len..len]);
+                        len = next_len;
+                        for (0..cells) |_| self.putc(0x08);
                         history_age = null;
                     }
                 },
@@ -1546,6 +1549,7 @@ pub fn r4_app_main(r4_app: *r4os.App) i32 {
         .inputtest => runInputSelftest(sys, true),
         .inputprobe => runInputProbe(sys, dev),
         .texttest => @import("console_text_test.zig").run(sys),
+        .graphemetest => runInputSelftest(sys, false),
         .textprobe => @import("console_text_test.zig").probe(sys),
         .textclose => @import("console_text_test.zig").closeProbe(sys),
     };
@@ -1976,6 +1980,7 @@ fn modeFromArgs(args_raw: []const u8) Mode {
     if (equalsIgnoreCase(args, "/INPUTTEST")) return .inputtest;
     if (equalsIgnoreCase(args, "/INPUTPROBE")) return .inputprobe;
     if (equalsIgnoreCase(args, "/TEXTTEST")) return .texttest;
+    if (equalsIgnoreCase(args, "/GRAPHEMETEST")) return .graphemetest;
     if (equalsIgnoreCase(args, "/TEXTPROBE")) return .textprobe;
     if (equalsIgnoreCase(args, "/TEXTCLOSE")) return .textclose;
     return .help;
@@ -2645,7 +2650,7 @@ fn runInputProbe(sys: r4os.r4sys.Context, dev: r4os.r4dev.Context) i32 {
 
     // Typed native/desktop scalars and the SSH stream take the same editor.
     // Captured history is inspected after the real command loop exits.
-    const unicode = "\xc3\xbc\xe2\x82\xac\xd0\x81\xc4\x80\xf0\x9f\x98\x80";
+    const unicode = "\xc3\xbc\xe2\x82\xac\xd0\x81\xc4\x80\xf0\x9f\x91\xa9\xe2\x80\x8d\xf0\x9f\x92\xbb";
     const original = "ECHO " ++ unicode;
     const changed = "ECHO \xc3\xbc\xe2\x82\xac\xd0\x81\xc4\x80!";
     for ([_]bool{ false, true }) |stream| {
@@ -2655,7 +2660,7 @@ fn runInputProbe(sys: r4os.r4sys.Context, dev: r4os.r4dev.Context) i32 {
             for (command) |byte| if (sys.consolePushEvents(handle, &.{r4os.input_events.utf8Byte(byte)}) != 1) return 13;
         } else {
             for ("ECHO ") |byte| if (sys.consolePushEvents(handle, &.{r4os.input_events.text(byte).?}) != 1) return 14;
-            for ([_]u32{ 0xfc, 0x20ac, 0x401, 0x100, 0x1f600 }) |value| if (sys.consolePushEvents(handle, &.{r4os.input_events.text(value).?}) != 1) return 15;
+            for ([_]u32{ 0xfc, 0x20ac, 0x401, 0x100, 0x1f469, 0x200d, 0x1f4bb }) |value| if (sys.consolePushEvents(handle, &.{r4os.input_events.text(value).?}) != 1) return 15;
             const controls = [_]r4os.abi.ConsoleInputEvent{
                 r4os.input_events.key(13),                                      r4os.input_events.key(10),
                 r4os.input_events.key(@intCast(r4os.abi.console_input_key_up)), r4os.input_events.key(8),

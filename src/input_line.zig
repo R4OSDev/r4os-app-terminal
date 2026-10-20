@@ -127,26 +127,32 @@ pub fn appendScalar(buffer: []u8, len: *usize, value: u32) ?[]const u8 {
     return buffer[start..len.*];
 }
 pub fn removeLast(buffer: []const u8) usize {
-    if (buffer.len == 0) return 0;
-    var start = buffer.len - 1;
-    while (start != 0 and buffer[start] & 0xc0 == 0x80) start -= 1;
-    return start;
+    return r4os.grapheme.previous(buffer, buffer.len) catch 0;
 }
 pub fn boundedPrefix(input: []const u8, capacity: usize) usize {
+    return r4os.grapheme.prefix(input, capacity) catch 0;
+}
+/// Console transcripts still advance one cell per printable scalar. Erase
+/// all those cells for a deleted cluster; segmentation supplies no width.
+pub fn erasedCells(buffer: []const u8) usize {
     var offset: usize = 0;
-    while (offset < input.len) {
-        const decoded = codec.decode(input[offset..]) catch break;
-        const count = switch (decoded) {
+    var cells: usize = 0;
+    while (offset < buffer.len) {
+        const decoded = codec.decode(buffer[offset..]) catch break;
+        const scalar = switch (decoded) {
             .incomplete => break,
-            .complete => |v| v.byte_length,
+            .complete => |value| value,
         };
-        if (count > capacity - offset) break;
-        offset += count;
+        if (scalar.value >= 0x20 and scalar.value != 0x7f and !(scalar.value >= 0x80 and scalar.value <= 0x9f)) cells += 1;
+        offset += scalar.byte_length;
     }
-    return offset;
+    return cells;
 }
 
 pub fn checkEvents() bool {
+    for ([_][]const u8{ "a\u{301}", "\u{1f1e9}\u{1f1ea}", "\u{1f469}\u{200d}\u{1f4bb}" }) |cluster| {
+        if (removeLast(cluster) != 0 or boundedPrefix(cluster, cluster.len - 1) != 0 or erasedCells(cluster) < 2) return false;
+    }
     var mixed: Decoder = .{};
     if (mixed.accept(r4os.input_events.utf8Byte(0xd0)) != null) return false;
     const direct = mixed.accept(r4os.input_events.text(0x20ac).?) orelse return false;
