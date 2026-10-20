@@ -24,9 +24,9 @@ const default_temp = "C:\\TEMP";
 const environment_registry_key = "SYSTEM\\Environment";
 const path_registry_value = "PATH";
 
-const KEY_UP: u8 = 0x80;
-const KEY_DOWN: u8 = 0x81;
-const KEY_F3: u8 = 0x82;
+const KEY_UP: u8 = @intCast(r4os.abi.console_input_key_up);
+const KEY_DOWN: u8 = @intCast(r4os.abi.console_input_key_down);
+const KEY_F3: u8 = @intCast(r4os.abi.console_input_key_f3);
 const OUTPUT_TEST_ITERATIONS: u32 = 96;
 const output_test_chunk = "R4OS shared console transcript 0123456789ABCDEF\r\n";
 
@@ -39,6 +39,8 @@ const Mode = enum {
     launchtest,
     batchtest,
     outputtest,
+    inputtest,
+    inputprobe,
 };
 
 const BuiltinResult = enum {
@@ -89,13 +91,12 @@ const TerminalState = struct {
     redirect_error: bool = false,
     exit_requested: bool = false,
     redirect_path: [PATH_MAX:0]u8 = .{0} ** PATH_MAX,
-    input_buffer: [64]u8 = .{0} ** 64,
+    input_buffer: [64]r4os.abi.ConsoleInputEvent = undefined,
     input_buffer_pos: usize = 0,
     input_buffer_len: usize = 0,
     input_generation: u64 = 0,
-    input_bulk_supported: bool = true,
     input_wait_supported: bool = true,
-    input_line_normalizer: input_line.Normalizer = .{},
+    input_decoder: input_line.Decoder = .{},
 
     fn run(self: *TerminalState, run_autoexec: bool) i32 {
         if (!self.initializeSession()) return 1;
@@ -109,8 +110,16 @@ const TerminalState = struct {
         var history_age: ?usize = null;
 
         while (true) {
-            const c = self.readInputByteBlocking() orelse return self.errorlevel;
-            switch (c) {
+            const action = self.readInputActionBlocking() orelse return self.errorlevel;
+            if (action == .text) {
+                const scalar = if (action.text < 128) @as(u32, upper(@intCast(action.text))) else action.text;
+                if (input_line.appendScalar(&input, &len, scalar)) |visible| {
+                    self.write(visible);
+                    history_age = null;
+                }
+                continue;
+            }
+            switch (action.key) {
                 '\n' => {
                     self.write("\r\n");
                     self.addHistory(input[0..len]);
@@ -122,7 +131,7 @@ const TerminalState = struct {
                 },
                 0x08 => {
                     if (len > 0) {
-                        len -= 1;
+                        len = input_line.removeLast(input[0..len]);
                         self.putc(0x08);
                         history_age = null;
                     }
@@ -146,7 +155,7 @@ const TerminalState = struct {
                         self.replaceInputFromHistory(age, input[0..], &len);
                     } else if (history_age != null) {
                         history_age = null;
-                        self.clearInputLine(len);
+                        self.clearInputLine(input[0..len]);
                         len = 0;
                     }
                 },
@@ -156,15 +165,7 @@ const TerminalState = struct {
                         self.replaceInputFromHistory(0, input[0..], &len);
                     }
                 },
-                else => {
-                    if (c >= 0x20 and c <= 0x7E and len < input.len) {
-                        const visible = upper(c);
-                        input[len] = visible;
-                        len += 1;
-                        self.putc(visible);
-                        history_age = null;
-                    }
-                },
+                else => {},
             }
         }
     }
@@ -198,7 +199,6 @@ const TerminalState = struct {
         self.input_buffer_pos = 0;
         self.input_buffer_len = 0;
         self.input_generation = 0;
-        self.input_bulk_supported = true;
         self.input_wait_supported = true;
         _ = self.setPath(default_path);
         self.loadStartupPersistentPath();
@@ -216,63 +216,42 @@ const TerminalState = struct {
         return true;
     }
 
-    fn readInputByteBlocking(self: *TerminalState) ?u8 {
+    fn readInputActionBlocking(self: *TerminalState) ?input_line.Action {
         while (true) {
-            if (self.input_buffer_pos < self.input_buffer_len) {
-                const value = self.input_buffer[self.input_buffer_pos];
+            while (self.input_buffer_pos < self.input_buffer_len) {
+                const event = self.input_buffer[self.input_buffer_pos];
                 self.input_buffer_pos += 1;
-                if (self.input_line_normalizer.accept(value)) |byte| return byte;
-                continue;
+                if (self.input_decoder.accept(event)) |action| return action;
             }
             self.input_buffer_pos = 0;
             self.input_buffer_len = 0;
-
-            if (self.input_bulk_supported) {
-                const read = self.sys.consoleRead(self.input_buffer[0..]);
-                if (read > 0) {
-                    self.input_buffer_len = @min(@as(usize, @intCast(read)), self.input_buffer.len);
-                    continue;
-                }
-                if (read < 0) self.input_bulk_supported = false;
+            const count = self.sys.consoleReadEvents(&self.input_buffer);
+            if (count > 0 and count <= self.input_buffer.len) {
+                self.input_buffer_len = @intCast(count);
+                continue;
             }
-
+            if (count < 0 or count > self.input_buffer.len) {
+                self.println("Typed console input unavailable");
+                self.errorlevel = 1;
+                self.exit_requested = true;
+                return null;
+            }
             if (self.sys.programShouldClose()) {
                 self.exit_requested = true;
                 return null;
             }
-
             if (self.input_wait_supported) {
-                var observed_generation = self.input_generation;
-                const wait_result = self.sys.consoleInputWait(
-                    self.input_generation,
-                    r4os.abi.io_wait_forever,
-                    &observed_generation,
-                );
-                self.input_generation = observed_generation;
-                switch (wait_result) {
-                    r4os.abi.console_input_wait_ready,
-                    r4os.abi.console_input_wait_timeout,
-                    => continue,
+                var observed = self.input_generation;
+                const result = self.sys.consoleInputWait(self.input_generation, r4os.abi.io_wait_forever, &observed);
+                self.input_generation = observed;
+                switch (result) {
+                    r4os.abi.console_input_wait_ready, r4os.abi.console_input_wait_timeout => continue,
                     r4os.abi.console_input_wait_error_closed => {
                         self.exit_requested = true;
                         return null;
                     },
-                    r4os.abi.console_input_wait_error_unsupported => {
-                        self.input_wait_supported = false;
-                        continue;
-                    },
                     else => self.input_wait_supported = false,
                 }
-            }
-
-            const value = self.sys.readKey();
-            if (value != 0) {
-                if (self.input_line_normalizer.accept(value)) |byte| return byte;
-                continue;
-            }
-            if (self.sys.programShouldClose()) {
-                self.exit_requested = true;
-                return null;
             }
             self.sys.taskYield();
         }
@@ -954,7 +933,7 @@ const TerminalState = struct {
         }
         if (arg.len != 0) return self.fail("Usage: PAUSE");
         self.write("Press any key to continue . . .");
-        _ = self.readInputByteBlocking() orelse {
+        _ = self.readInputActionBlocking() orelse {
             self.write("\r\n");
             self.setErrorlevel(0);
             return .ok;
@@ -1506,7 +1485,7 @@ const TerminalState = struct {
             const latest = self.historyIndexFromAge(0);
             if (self.history_lens[latest] == cleaned.len and equalsIgnoreCase(self.history[latest][0..self.history_lens[latest]], cleaned)) return;
         }
-        const count = @min(cleaned.len, HISTORY_LINE_MAX);
+        const count = input_line.boundedPrefix(cleaned, HISTORY_LINE_MAX);
         @memcpy(self.history[self.history_next][0..count], cleaned[0..count]);
         self.history_lens[self.history_next] = count;
         self.history_next = (self.history_next + 1) % HISTORY_DEPTH;
@@ -1528,16 +1507,17 @@ const TerminalState = struct {
 
     fn replaceInputFromHistory(self: *TerminalState, age: usize, input: []u8, len: *usize) void {
         const index = self.historyIndexFromAge(age);
-        self.clearInputLine(len.*);
+        self.clearInputLine(input[0..len.*]);
         const new_len = self.history_lens[index];
         @memcpy(input[0..new_len], self.history[index][0..new_len]);
         len.* = new_len;
         self.write(input[0..new_len]);
     }
 
-    fn clearInputLine(self: *TerminalState, len: usize) void {
+    fn clearInputLine(self: *TerminalState, text: []const u8) void {
+        const count = r4std.codec.scalarCount(text) catch return;
         var i: usize = 0;
-        while (i < len) : (i += 1) self.putc(0x08);
+        while (i < count) : (i += 1) self.putc(0x08);
     }
 
     fn historyIndexFromAge(self: *TerminalState, age: usize) usize {
@@ -1560,6 +1540,8 @@ pub fn r4_app_main(r4_app: *r4os.App) i32 {
         .launchtest => runLaunchSelftest(sys, dev),
         .batchtest => runBatchSelftest(sys, dev),
         .outputtest => runOutputTest(sys),
+        .inputtest => runInputSelftest(sys, true),
+        .inputprobe => runInputProbe(sys, dev),
     };
 }
 
@@ -1591,6 +1573,10 @@ fn runSelftest(sys: r4os.r4sys.Context, dev: r4os.r4dev.Context) i32 {
         sys.println("Terminal input CR/LF/CRLF selftest: FAILED");
         ok = false;
     } else sys.println("Terminal input CR/LF/CRLF selftest: OK");
+    if (!input_line.checkEvents()) {
+        sys.println("Terminal Unicode input/edit/history selftest: FAILED");
+        ok = false;
+    } else sys.println("Terminal Unicode input/edit/history selftest: OK");
     if (!sys.contractValid()) {
         sys.println("Terminal selftest: API header invalid");
         ok = false;
@@ -1654,6 +1640,7 @@ fn runSelftest(sys: r4os.r4sys.Context, dev: r4os.r4dev.Context) i32 {
         sys.println("Terminal userland session selftest: FAILED");
         return 1;
     }
+    if (runInputSelftest(sys, false) != 0) return 1;
     if (runBuiltinSelftest(sys, dev) != 0) return 1;
     if (!runOutputTranscriptSelftest(sys, dev)) return 1;
     sys.println("Terminal userland selftest: OK");
@@ -1980,6 +1967,8 @@ fn modeFromArgs(args_raw: []const u8) Mode {
     if (equalsIgnoreCase(args, "/LAUNCHTEST") or equalsIgnoreCase(args, "--LAUNCHTEST")) return .launchtest;
     if (equalsIgnoreCase(args, "/BATCHTEST") or equalsIgnoreCase(args, "--BATCHTEST")) return .batchtest;
     if (equalsIgnoreCase(args, "/OUTPUTTEST") or equalsIgnoreCase(args, "--OUTPUTTEST")) return .outputtest;
+    if (equalsIgnoreCase(args, "/INPUTTEST")) return .inputtest;
+    if (equalsIgnoreCase(args, "/INPUTPROBE")) return .inputprobe;
     return .help;
 }
 
@@ -2610,4 +2599,126 @@ fn equalsIgnoreCase(a: []const u8, b: []const u8) bool {
 fn upper(c: u8) u8 {
     if (c >= 'a' and c <= 'z') return c - ('a' - 'A');
     return c;
+}
+
+/// Runs in its own console-host instance: there is no competing reader while
+/// the queue is filled. This proves transport/backpressure before editing.
+fn runInputProbe(sys: r4os.r4sys.Context, dev: r4os.r4dev.Context) i32 {
+    const bundle = sys.base.bundle orelse return 1;
+    var handle: r4os.abi.ProgramProcessHandle = .{};
+    if (bundle.raw.instance_id > 0xffffffff or sys.programOpenHandle(@intCast(bundle.raw.instance_id), &handle) != r4os.abi.program_handle_ok) return 2;
+    var events: [64]r4os.abi.ConsoleInputEvent = @splat(r4os.input_events.text(0x20ac).?);
+    var accepted: usize = 0;
+    while (accepted < 1365) {
+        const count = @min(1365 - accepted, events.len);
+        if (sys.consolePushEvents(handle, events[0..count]) != count) return 3;
+        accepted += count;
+    }
+    if (sys.consolePushEvents(handle, &.{r4os.input_events.text('Q').?}) != 0) return 4;
+    const invalid = [_]r4os.abi.ConsoleInputEvent{ r4os.input_events.text('Q').?, .{ .kind = 1, .value = 0xd800 } };
+    if (sys.consolePushEvents(handle, &invalid) != r4os.abi.console_input_wait_error_invalid) return 5;
+    var legacy: [1]u8 = .{0xa5};
+    if (sys.consoleRead(&legacy) != 0 or legacy[0] != 0xa5) return 6;
+    var remaining: usize = 1365;
+    while (remaining != 0) {
+        @memset(&events, r4os.input_events.text('Z').?);
+        const count = sys.consoleReadEvents(&events);
+        if (count <= 0 or count > @min(remaining, events.len)) return 7;
+        for (events[0..@intCast(count)]) |event| if (event.kind != 1 or event.value != 0x20ac) return 8;
+        for (events[@intCast(count)..]) |event| if (event.value != 'Z') return 9;
+        remaining -= @intCast(count);
+    }
+    if (sys.consoleReadEvents(&events) != 0) return 10;
+    var stale = handle;
+    stale.generation +%= 1;
+    if (sys.consolePushEvents(stale, &.{r4os.input_events.text('Q').?}) != r4os.abi.console_input_wait_error_closed or sys.consoleReadEvents(&events) != 0) return 11;
+    if (!input_line.checkEvents()) return 12;
+
+    // Typed native/desktop scalars and the SSH stream take the same editor.
+    // Captured history is inspected after the real command loop exits.
+    const unicode = "\xc3\xbc\xe2\x82\xac\xd0\x81\xc4\x80\xf0\x9f\x98\x80";
+    const original = "ECHO " ++ unicode;
+    const changed = "ECHO \xc3\xbc\xe2\x82\xac\xd0\x81\xc4\x80!";
+    for ([_]bool{ false, true }) |stream| {
+        if (stream) {
+            const command = original ++ "\r\n\x1b[A\x08!\n\x1bOR\nEXIT\r";
+            // One-byte writes exercise every possible UTF-8 and escape split.
+            for (command) |byte| if (sys.consolePushEvents(handle, &.{r4os.input_events.utf8Byte(byte)}) != 1) return 13;
+        } else {
+            for ("ECHO ") |byte| if (sys.consolePushEvents(handle, &.{r4os.input_events.text(byte).?}) != 1) return 14;
+            for ([_]u32{ 0xfc, 0x20ac, 0x401, 0x100, 0x1f600 }) |value| if (sys.consolePushEvents(handle, &.{r4os.input_events.text(value).?}) != 1) return 15;
+            const controls = [_]r4os.abi.ConsoleInputEvent{
+                r4os.input_events.key(13),                                      r4os.input_events.key(10),
+                r4os.input_events.key(@intCast(r4os.abi.console_input_key_up)), r4os.input_events.key(8),
+                r4os.input_events.text('!').?,                                  r4os.input_events.key(13),
+                r4os.input_events.key(@intCast(r4os.abi.console_input_key_f3)), r4os.input_events.key(13),
+            };
+            if (sys.consolePushEvents(handle, &controls) != controls.len) return 16;
+            for ("EXIT\r") |byte| {
+                const event = if (byte == 13) r4os.input_events.key(byte) else r4os.input_events.text(byte).?;
+                if (sys.consolePushEvents(handle, &.{event}) != 1) return 17;
+            }
+        }
+        var state = TerminalState{ .sys = sys, .dev = dev };
+        if (state.run(false) != 0 or state.history_count != 3) return 18;
+        const first = state.historyIndexFromAge(2);
+        const second = state.historyIndexFromAge(1);
+        if (!equalsBytes(state.history[first][0..state.history_lens[first]], original) or
+            !equalsBytes(state.history[second][0..state.history_lens[second]], changed)) return 19;
+        // A512-byte history entry must not retain half of a multibyte scalar.
+        var long: [514]u8 = @splat('A');
+        @memcpy(long[511..514], "\xe2\x82\xac");
+        state.addHistory(&long);
+        if (state.history_lens[state.historyIndexFromAge(0)] != 511) return 20;
+    }
+    sys.println("Terminal typed input queue/edit/history probe: OK");
+    return 0;
+}
+
+fn runInputSelftest(sys: r4os.r4sys.Context, include_desktop: bool) i32 {
+    var handle: r4os.abi.ProgramProcessHandle = .{};
+    const rc = sys.programSpawnWithConsoleHostHandle("C:\\R4OS\\SOFTWARE\\TERMINAL\\TERMINAL.R4X", "/INPUTPROBE", .console, .terminal_mode, &handle);
+    if (rc != r4os.abi.program_handle_ok) return 1;
+    var reaped = false;
+    defer if (!reaped) {
+        _ = sys.programHandleKill(&handle);
+        var completion: r4os.abi.ProgramProcessCompletion = .{};
+        _ = sys.programHandleWait(&handle, r4os.abi.thread_wait_forever, &completion);
+        _ = sys.programHandleReap(&handle, &completion);
+    };
+    var completion: r4os.abi.ProgramProcessCompletion = .{};
+    if (sys.programHandleWait(&handle, 1000, &completion) != r4os.abi.program_handle_ok) return 2;
+    if (completion.exit_code != 0) {
+        sys.write("Terminal typed input child failure=");
+        sys.printI32(completion.exit_code);
+        sys.println("");
+        return 3;
+    }
+    if (sys.programHandleReap(&handle, &completion) != r4os.abi.program_handle_ok) return 4;
+    reaped = true;
+    if (sys.consolePushEvents(handle, &.{r4os.input_events.text('Q').?}) != r4os.abi.console_input_wait_error_closed) return 5;
+    if (include_desktop) {
+        // The ordinary command dispatcher deliberately rejects launching the
+        // desktop shell as an external command. This explicit diagnostic uses
+        // the process API and preserves that product guard.
+        var desktop: r4os.abi.ProgramProcessHandle = .{};
+        if (sys.programSpawnHandle("C:\\R4OS\\SOFTWARE\\DESKTOP\\R4DESK.R4X", "/INPUTTEST", .gui, &desktop) != r4os.abi.program_handle_ok) return 6;
+        var desktop_reaped = false;
+        defer if (!desktop_reaped) {
+            _ = sys.programHandleKill(&desktop);
+            _ = sys.programHandleWait(&desktop, r4os.abi.thread_wait_forever, &completion);
+            _ = sys.programHandleReap(&desktop, &completion);
+        };
+        if (sys.programHandleWait(&desktop, 3000, &completion) != r4os.abi.program_handle_ok) return 7;
+        if (completion.exit_code != 0) {
+            sys.write("Desktop typed input child failure=");
+            sys.printI32(completion.exit_code);
+            sys.println("");
+            return 8;
+        }
+        if (sys.programHandleReap(&desktop, &completion) != r4os.abi.program_handle_ok) return 9;
+        desktop_reaped = true;
+    }
+    sys.println("Terminal typed input full queue, scalar retention, stale target, UTF8 stream and real editing/history: OK");
+    return 0;
 }

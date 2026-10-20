@@ -4,7 +4,7 @@
 
 ## Package
 
-- Version: `0.1.13`
+- Version: `0.1.17`
 - Image target: `/R4OS/SOFTWARE/TERMINAL/TERMINAL.R4X`
 - Image scope: `slim`
 - Canonical project manifest: `module.R4MF`
@@ -70,3 +70,7 @@ A short SMP4 guest checks same-named private files, TYPE/COPY/REN/DEL/MD/RD,
 redirection, direct child and nested Terminal inheritance, failed directory
 and drive changes, short CWD reads and VOL on two local volumes. R4OS and
 Recovery carry the same correction; no broad shell or filesystem profile.
+
+## Console input
+
+Typed console input uses R4DESK16 and R4STD CODEC_V1. Unicode scalars and logical keys remain separate; SSH stream bytes retain a per-instance UTF-8 decoder across reads. Backspace removes a complete scalar, and bounded history entries end at scalar boundaries. `/INPUTTEST` runs an isolated console child through full-queue, stale-handle, partial UTF-8 and real command/history checks, then starts the explicit Desktop input diagnostic through the process API. Run this combined check in standalone Terminal Mode with no other Desktop owner. `/SELFTEST` includes the console child without starting another Desktop. Grapheme editing and console rendering are separate roadmap work.
