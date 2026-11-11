@@ -130,3 +130,21 @@ Laufwerkswechsel waehlen weiterhin die Wurzel. VOL ohne Operand zeigt das
 aktuelle Laufwerk. Ein kurzer SMP4-Lauf prueft private gleichnamige Dateien,
 relative Operationen, Umleitung, zwei Kindstartformen, Fehlwechsel und VOL
 auf zwei lokalen Volumes. Keine zusaetzlichen kanonischen Testdateien.
+
+API-Migration 0.90.63
+---------------------
+TERMINAL 0.1.20 verwendet Start2, die Query2-Plattformgruppen und die
+eigenstaendigen R4STD-Tabellen. Der Argumentcursor liest die Startschalter.
+Die Shell fuehrt /C, /NOAUTOEXEC und AUTOEXEC aus. Terminal Mode und
+Fensterkonsole besitzen weiterhin ihre jeweilige Konsolensitzung.
+
+Explizite Pipebindungen werden gemeinsam ueber LaunchIo an ein neues
+Start2-Kind gebunden. Der normale Konsolenstart laedt Start1- und
+Start2-Module. Die Shell liest nur die gerade benoetigten
+Eingabebytes und behaelt exakte bestaetigte Ausgabepraefixe bei Backpressure.
+Pipe-Eingabe verwendet LF oder CRLF. Terminal liest den LF vor dem
+Kindstart, damit das Kind seine Daten ab dem ersten Byte bekommt.
+EOF schliesst den letzten Eingabebefehl ab. Eine Bereitschaft im WaitSet
+beobachtet den exakten Kindprozess. Erst Reap gibt seine Completion frei.
+Die Konsolen-Diagnosen fuer Eingabe und Text pruefen die interaktive
+Konsoleneingabe und benoetigen eine Eingabe- und Ausgabekonsole.

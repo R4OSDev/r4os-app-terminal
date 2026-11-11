@@ -1,3 +1,4 @@
+const std = @import("std");
 const r4os = @import("r4os");
 const r4std = @import("r4std");
 const input_line = @import("input_line.zig");
@@ -68,6 +69,10 @@ const PersistentPathRead = struct {
 };
 
 const TerminalState = struct {
+    stdio: ?r4os.launch_io.Stdio = null,
+    pipe_clock: ?r4os.inventory_reader.PlatformClock = null,
+    pipe_output_failed: bool = false,
+    stdin_eof: bool = false,
     sys: r4os.r4sys.Context,
     dev: r4os.r4dev.Context,
     history: [HISTORY_DEPTH][HISTORY_LINE_MAX]u8 = .{.{0} ** HISTORY_LINE_MAX} ** HISTORY_DEPTH,
@@ -113,10 +118,14 @@ const TerminalState = struct {
         var len: usize = 0;
         var history_age: ?usize = null;
 
-        while (true) {
-            const action = self.readInputActionBlocking() orelse return self.errorlevel;
+        const piped_input = self.hasPipe(0);
+        while (!self.pipe_output_failed) {
+            const action = self.readInputActionBlocking() orelse {
+                if (self.stdin_eof and len != 0) self.executeLine(input[0..len]);
+                return self.errorlevel;
+            };
             if (action == .text) {
-                const scalar = if (action.text < 128) @as(u32, upper(@intCast(action.text))) else action.text;
+                const scalar = if (!piped_input and action.text < 128) @as(u32, upper(@intCast(action.text))) else action.text;
                 if (input_line.appendScalar(&input, &len, scalar)) |visible| {
                     self.write(visible);
                     history_age = null;
@@ -174,6 +183,7 @@ const TerminalState = struct {
                 else => {},
             }
         }
+        return self.errorlevel;
     }
 
     fn printRecoveryBanner(self: *TerminalState) void {
@@ -222,7 +232,50 @@ const TerminalState = struct {
         return true;
     }
 
+    fn hasPipe(self: *const TerminalState, stream: u32) bool {
+        const io = if (self.stdio) |*value| value else return false;
+        return (io.binding(stream) orelse return false).kind == r4os.abi.launch_io_pipe;
+    }
+
+    fn pipeDeadline(self: *TerminalState) ?r4os.byte_pipe.Deadline {
+        const clock = if (self.pipe_clock) |*value| value else return null;
+        var sample: r4os.time_contract.checked.ClockSample = .{};
+        if (r4os.inventory_reader.PlatformClock.sample(clock, &sample) != 0) return null;
+        const interval = r4os.time_contract.timeoutFinite(r4os.time_contract.durationFromNanoseconds(250_000_000));
+        const budget = r4os.time_contract.checked.DeadlineBudget.init(sample, interval) catch return null;
+        return r4os.byte_pipe.deadline(budget) catch null;
+    }
+
+    fn readPipeAction(self: *TerminalState, io: *const r4os.launch_io.Stdio) ?input_line.Action {
+        const a = r4os.abi;
+        while (!self.sys.programShouldClose()) {
+            const limit = self.pipeDeadline() orelse break;
+            // Leave the next command's bytes in the shared stream. A child
+            // can read them from its own duplicated stdin end.
+            var byte: [1]u8 = undefined;
+            var progress: r4os.byte_pipe.Progress = .{};
+            if (io.read(&byte, limit, &progress) != 0) break;
+            if (progress.state == a.byte_pipe_ready and progress.bytes == 1) {
+                // Pipe lines end at LF. For CRLF, consume LF before passing
+                // the reader to a child whose data begins after that line.
+                if (byte[0] == '\r') continue;
+                if (self.input_decoder.accept(r4os.input_events.utf8Byte(byte[0]))) |action| return action;
+                continue;
+            }
+            if (progress.state == a.byte_pipe_timed_out) continue;
+            if (progress.state == a.byte_pipe_eof) {
+                self.stdin_eof = true;
+                return null;
+            }
+            break;
+        }
+        if (!self.sys.programShouldClose()) self.setErrorlevel(1);
+        self.exit_requested = true;
+        return null;
+    }
+
     fn readInputActionBlocking(self: *TerminalState) ?input_line.Action {
+        if (self.hasPipe(0)) return self.readPipeAction(&self.stdio.?);
         while (true) {
             while (self.input_buffer_pos < self.input_buffer_len) {
                 const event = self.input_buffer[self.input_buffer_pos];
@@ -266,8 +319,31 @@ const TerminalState = struct {
     fn write(self: *TerminalState, value: []const u8) void {
         if (self.redirect_active) {
             self.writeRedirect(value);
-        } else {
+            return;
+        }
+        const io = if (self.stdio) |*stdio| stdio else {
             self.sys.write(value);
+            return;
+        };
+        const a = r4os.abi;
+        const piped = self.hasPipe(1);
+        var remaining = value;
+        while (remaining.len != 0 and !self.pipe_output_failed) {
+            const limit: r4os.byte_pipe.Deadline = if (piped) blk: {
+                if (self.sys.programShouldClose()) return;
+                break :blk self.pipeDeadline() orelse {
+                    self.pipe_output_failed = true;
+                    return;
+                };
+            } else .{};
+            var progress: r4os.byte_pipe.Progress = .{};
+            const rc = io.write(1, remaining, limit, &progress);
+            if (rc == 0 and piped and progress.state == a.byte_pipe_timed_out and progress.bytes == 0) continue;
+            if (rc != 0 or progress.state != a.byte_pipe_ready or progress.bytes == 0 or progress.bytes > remaining.len) {
+                self.pipe_output_failed = true;
+                return;
+            }
+            remaining = remaining[@intCast(progress.bytes)..];
         }
     }
 
@@ -282,19 +358,11 @@ const TerminalState = struct {
     }
 
     fn printI32(self: *TerminalState, value: i32) void {
-        if (!self.redirect_active) {
-            self.sys.printI32(value);
-            return;
-        }
         var buf: [16]u8 = undefined;
         self.write(formatI32(value, buf[0..]));
     }
 
     fn printU64(self: *TerminalState, value: u64) void {
-        if (!self.redirect_active) {
-            self.sys.printU64(value);
-            return;
-        }
         var buf: [24]u8 = undefined;
         self.write(formatU64(value, buf[0..]));
     }
@@ -505,16 +573,20 @@ const TerminalState = struct {
             return .failed;
         }
         const launch_policy: r4os.abi.LaunchPolicy = if (console_mode_launch) .console else .auto;
-        const resources = r4os.Resources{ .sys = self.sys };
-        var process = switch (resources.spawn(.{ .ptr = @ptrCast(&path_z), .len = @intCast(resolved.path.len) }, &args_z, launch_policy)) {
-            .process => |handle| handle,
-            .failure => |raw| {
-                self.reportLaunchFailure(resolved.path, raw);
-                self.setErrorlevel(1);
-                return .failed;
-            },
-        };
-        const exit_code = switch (process.wait(r4os.time_contract.timeoutForever())) {
+        var child: r4os.abi.ProgramProcessHandle = .{};
+        const launch_result = if (self.hasPipe(0) or self.hasPipe(1) or self.hasPipe(2)) blk: {
+            const io = &self.stdio.?;
+            var request = io.snapshot;
+            request.policy = @intFromEnum(launch_policy);
+            request.console_host = 0;
+            break :blk r4os.launch_io.launch(io.context, &path_z, &args_z, request, &child);
+        } else self.sys.programSpawnHandle(&path_z, &args_z, launch_policy, &child);
+        if (launch_result != 0) {
+            self.reportLaunchFailure(resolved.path, launch_result);
+            self.setErrorlevel(1);
+            return .failed;
+        }
+        const exit_code = switch (self.waitChild(child)) {
             .exited => |code| code,
             .failure => |raw| {
                 self.reportLaunchFailure(resolved.path, raw);
@@ -527,13 +599,42 @@ const TerminalState = struct {
                 return .failed;
             },
         };
-        if (process.valid()) {
-            self.reportLaunchFailure(resolved.path, r4os.abi.err_closed);
-            self.setErrorlevel(1);
-            return .failed;
-        }
         self.setErrorlevel(exit_code);
         return if (self.errorlevel == 0) .ok else .failed;
+    }
+
+    fn waitChild(self: *const TerminalState, handle: r4os.abi.ProgramProcessHandle) r4os.app_resources.ProcessWait {
+        const a = r4os.abi;
+        var completion: a.ProgramProcessCompletion = .{};
+        const ready = if (self.sys.base.generation2) |context| waitChildReady(context, handle) else false;
+        if (!ready) {
+            if (self.sys.programShouldClose()) return .{ .failure = a.err_closed };
+            const rc = self.sys.programHandleWait(&handle, a.io_wait_forever, &completion);
+            if (rc != 0) return .{ .failure = rc };
+        }
+        const reaped = self.sys.programHandleReap(&handle, &completion);
+        if (reaped != 0) return .{ .failure = reaped };
+        if (!std.meta.eql(handle, completion.handle) or completion.flags & a.program_completion_flag_ready == 0)
+            return .{ .failure = a.program_handle_error_stale };
+        return .{ .exited = completion.exit_code };
+    }
+
+    fn waitChildReady(context: *const r4os.platform2.Context, handle: r4os.abi.ProgramProcessHandle) bool {
+        const ws = r4os.wait_set;
+        const a = r4os.abi;
+        var source: ws.Source = .{};
+        if (ws.prepare(context, ws.process(handle, 0), &source) != 0) return false;
+        var waiting: ws.Set = undefined;
+        if (ws.Set.init(context, 1, &waiting) != 0) return false;
+        defer _ = waiting.close();
+        var registration: u64 = 0;
+        if (waiting.enroll(source, &registration) != 0) return false;
+        var events: [1]ws.Event = undefined;
+        var batch: ws.Batch = .{};
+        return waiting.wait(.{ .kind = a.timeout_kind_forever }, &events, &batch) == 0 and
+            batch.outcome == a.waitset_outcome_ready and batch.count == 1 and
+            events[0].registration == registration and events[0].kind == a.waitset_source_process and
+            events[0].flags == a.waitset_event_ready;
     }
 
     fn resolveBatchFile(self: *TerminalState, name: []const u8, out: []u8) ?[]const u8 {
@@ -1531,87 +1632,110 @@ const TerminalState = struct {
     }
 };
 
-pub fn r4_app_main(r4_app: *r4os.App) i32 {
-    if (!r4std.init(r4_app.startContext())) return r4os.abi.err_no_group;
-    const sys = r4_app.system();
-    const dev = r4_app.devicesLowLevel() orelse return r4os.abi.err_no_group;
-    const args = zSpan(sys.argsRaw());
-    if (commandFromArgs(args)) |command| return runCommand(sys, dev, command);
-    return switch (modeFromArgs(args)) {
-        .primary => runPrimary(sys, dev, true),
-        .primary_no_autoexec => runPrimary(sys, dev, false),
-        .help => runHelp(sys),
-        .selftest => runSelftest(sys, dev),
-        .builtintest => runBuiltinSelftest(sys, dev),
-        .launchtest => runLaunchSelftest(sys, dev),
-        .batchtest => runBatchSelftest(sys, dev),
-        .outputtest => runOutputTest(sys),
+pub fn r4_app_main(app: *r4os.App2) i32 {
+    const a = r4os.abi;
+    if (!r4std.init2(app.raw)) return a.err_no_group;
+    const sys = app.system();
+    const dev = app.devicesLowLevel() orelse return a.err_no_group;
+    var stdio: r4os.launch_io.Stdio = undefined;
+    const rc = app.stdio(&stdio);
+    if (rc != 0) return rc;
+    var state = TerminalState{ .sys = sys, .dev = dev, .stdio = stdio };
+    defer for (0..3) |stream| {
+        _ = state.stdio.?.close(@intCast(stream));
+    };
+    const piped = state.hasPipe(0) or state.hasPipe(1) or state.hasPipe(2);
+    if (piped) state.pipe_clock = app.clock() catch return a.err_no_fn;
+    const result = run(&state, app.args(), app.raw.instance_id);
+    return if (result == 0 and state.pipe_output_failed) 1 else result;
+}
+
+fn run(state: *TerminalState, args: []const u8, instance_id: u64) i32 {
+    if (commandFromArgs(args)) |command| {
+        if (!state.initializeSession()) return 1;
+        state.executeLine(command);
+        return state.errorlevel;
+    }
+    const sys = state.sys;
+    const dev = state.dev;
+    const mode = modeFromArgs(args);
+    switch (mode) {
+        .selftest, .inputtest, .inputprobe, .texttest, .graphemetest, .textprobe, .textclose => if (state.hasPipe(0) or state.hasPipe(1)) {
+            state.println("This test requires a console.");
+            return 1;
+        },
+        else => {},
+    }
+    return switch (mode) {
+        .primary => state.run(true),
+        .primary_no_autoexec => state.run(false),
+        .help => runHelp(state),
+        .selftest => runSelftest(state),
+        .builtintest => runBuiltinSelftest(state),
+        .launchtest => runLaunchSelftest(state),
+        .batchtest => runBatchSelftest(state),
+        .outputtest => runOutputTest(state),
         .inputtest => runInputSelftest(sys, true),
-        .inputprobe => runInputProbe(sys, dev),
+        .inputprobe => runInputProbe(sys, dev, currentProcess(sys, instance_id) orelse return 1),
         .texttest => @import("console_text_test.zig").run(sys),
         .graphemetest => runInputSelftest(sys, false),
-        .textprobe => @import("console_text_test.zig").probe(sys),
+        .textprobe => @import("console_text_test.zig").probe(sys, currentProcess(sys, instance_id) orelse return 1),
         .textclose => @import("console_text_test.zig").closeProbe(sys),
     };
 }
 
-fn runPrimary(sys: r4os.r4sys.Context, dev: r4os.r4dev.Context, run_autoexec: bool) i32 {
-    var state = TerminalState{ .sys = sys, .dev = dev };
-    return state.run(run_autoexec);
+fn currentProcess(sys: r4os.r4sys.Context, instance_id: u64) ?r4os.abi.ProgramProcessHandle {
+    const id = std.math.cast(u32, instance_id) orelse return null;
+    var handle: r4os.abi.ProgramProcessHandle = .{};
+    if (sys.programOpenHandle(id, &handle) != r4os.abi.program_handle_ok) return null;
+    return handle;
 }
 
-fn runCommand(sys: r4os.r4sys.Context, dev: r4os.r4dev.Context, command: []const u8) i32 {
-    var state = TerminalState{ .sys = sys, .dev = dev };
-    if (!state.initializeSession()) return 1;
-    state.executeLine(command);
-    return state.errorlevel;
-}
-
-fn runHelp(sys: r4os.r4sys.Context) i32 {
-    sys.println("TERMINAL.R4X - R4OS terminal shell");
-    sys.println("Usage: TERMINAL.R4X [/?] [/NOAUTOEXEC] [/C command] [/SELFTEST] [/BUILTINTEST] [/LAUNCHTEST] [/BATCHTEST]");
-    sys.println("Default mode runs userland session, prompt, environment, input/history and simple built-ins.");
-    sys.println("EXIT ends the current Terminal session.");
-    sys.println("/NOAUTOEXEC starts an interactive session without C:\\AUTOEXEC.BAT.");
-    sys.println("/C command runs one command through the normal Terminal command path and exits.");
+fn runHelp(state: *TerminalState) i32 {
+    state.println("TERMINAL.R4X - R4OS terminal shell");
+    state.println("Usage: TERMINAL.R4X [/?] [/NOAUTOEXEC] [/C command] [/SELFTEST] [/BUILTINTEST] [/LAUNCHTEST] [/BATCHTEST]");
+    state.println("Default mode runs userland session, prompt, environment, input/history and simple built-ins.");
+    state.println("EXIT ends the current Terminal session.");
+    state.println("/NOAUTOEXEC starts an interactive session without C:\\AUTOEXEC.BAT.");
+    state.println("/C command runs one command through the normal Terminal command path and exits.");
     return 0;
 }
 
-fn runSelftest(sys: r4os.r4sys.Context, dev: r4os.r4dev.Context) i32 {
+fn runSelftest(state: *TerminalState) i32 {
+    const sys = state.sys;
     var ok = true;
     if (!input_line.checkExamples()) {
-        sys.println("Terminal input CR/LF/CRLF selftest: FAILED");
+        state.println("Terminal input CR/LF/CRLF selftest: FAILED");
         ok = false;
-    } else sys.println("Terminal input CR/LF/CRLF selftest: OK");
+    } else state.println("Terminal input CR/LF/CRLF selftest: OK");
     if (!input_line.checkEvents()) {
-        sys.println("Terminal Unicode input/edit/history selftest: FAILED");
+        state.println("Terminal Unicode input/edit/history selftest: FAILED");
         ok = false;
-    } else sys.println("Terminal Unicode input/edit/history selftest: OK");
+    } else state.println("Terminal Unicode input/edit/history selftest: OK");
     if (!sys.contractValid()) {
-        sys.println("Terminal selftest: API header invalid");
+        state.println("Terminal selftest: API header invalid");
         ok = false;
     }
     if (!sys.base.hasDeskFn("program_set_console_host")) {
-        sys.println("Terminal selftest: console-host control API missing");
+        state.println("Terminal selftest: console-host control API missing");
         ok = false;
     }
     if (!sys.exists("C:\\R4OS\\SOFTWARE\\TERMINAL\\TERMINAL.R4X")) {
-        sys.println("Terminal selftest: C:\\R4OS\\SOFTWARE\\TERMINAL\\TERMINAL.R4X missing");
+        state.println("Terminal selftest: C:\\R4OS\\SOFTWARE\\TERMINAL\\TERMINAL.R4X missing");
         ok = false;
     }
     if (!sys.exists("C:\\AUTOEXEC.BAT")) {
-        sys.println("Terminal selftest: C:\\AUTOEXEC.BAT missing");
+        state.println("Terminal selftest: C:\\AUTOEXEC.BAT missing");
         ok = false;
     }
     if (!ok) {
-        sys.println("Terminal userland selftest: FAILED");
+        state.println("Terminal userland selftest: FAILED");
         return 1;
     }
-    var state = TerminalState{ .sys = sys, .dev = dev };
     if (!state.initializeSession()) return 1;
     var version_data: [VERSION_FILE_MAX]u8 = undefined;
     if (equalsIgnoreCase(state.releaseVersion(version_data[0..]), version_unknown)) {
-        sys.println("Terminal selftest: VERSION.R4S not readable");
+        state.println("Terminal selftest: VERSION.R4S not readable");
         ok = false;
     }
     ok = state.path_len != 0 and state.shell_len != 0 and state.prompt_len != 0 and state.cwd_len != 0 and ok;
@@ -1619,48 +1743,48 @@ fn runSelftest(sys: r4os.r4sys.Context, dev: r4os.r4dev.Context) i32 {
     ok = state.errorlevel == 7 and ok;
     state.setErrorlevel(0);
     ok = equalsIgnoreCase(state.path_env[0..state.path_len], default_path) and ok;
-    ok = expectBuiltin(&state, "PATH C:\\R4OS\\SOFTWARE\\TERMINAL;C:\\R4OS\\SOFTWARE\\TERMINAL\\DIAG") and ok;
+    ok = expectBuiltin(state, "PATH C:\\R4OS\\SOFTWARE\\TERMINAL;C:\\R4OS\\SOFTWARE\\TERMINAL\\DIAG") and ok;
     ok = equalsIgnoreCase(state.path_env[0..state.path_len], "C:\\R4OS\\SOFTWARE\\TERMINAL;C:\\R4OS\\SOFTWARE\\TERMINAL\\DIAG") and ok;
     const too_long_path: [ENV_VALUE_MAX + 1]u8 = .{'X'} ** (ENV_VALUE_MAX + 1);
     ok = !state.setPath(too_long_path[0..]) and ok;
     ok = equalsIgnoreCase(state.path_env[0..state.path_len], "C:\\R4OS\\SOFTWARE\\TERMINAL;C:\\R4OS\\SOFTWARE\\TERMINAL\\DIAG") and ok;
-    ok = expectBuiltin(&state, "PROMPT $P$G") and ok;
-    ok = expectBuiltin(&state, "SET TEMP=C:\\TEMP") and ok;
-    ok = expectBuiltin(&state, "SET SHELL=C:\\R4OS\\SOFTWARE\\TERMINAL\\TERMINAL.R4X") and ok;
-    ok = expectFailure(&state, "DESKTOP EXTRA") and ok;
-    ok = expectCommandFailure(&state, "DESK") and ok;
+    ok = expectBuiltin(state, "PROMPT $P$G") and ok;
+    ok = expectBuiltin(state, "SET TEMP=C:\\TEMP") and ok;
+    ok = expectBuiltin(state, "SET SHELL=C:\\R4OS\\SOFTWARE\\TERMINAL\\TERMINAL.R4X") and ok;
+    ok = expectFailure(state, "DESKTOP EXTRA") and ok;
+    ok = expectCommandFailure(state, "DESK") and ok;
     if (sys.exists("C:\\R4OS\\SOFTWARE\\DESKTOP\\R4DESK.R4X")) {
-        ok = expectCommandFailure(&state, "C:\\R4OS\\SOFTWARE\\DESKTOP\\R4DESK.R4X /NOHOSTTEST") and ok;
+        ok = expectCommandFailure(state, "C:\\R4OS\\SOFTWARE\\DESKTOP\\R4DESK.R4X /NOHOSTTEST") and ok;
     }
-    ok = expectBuiltin(&state, "CD C:\\") and ok;
-    ok = expectCwd(&state, "C:\\") and ok;
-    ok = expectBuiltin(&state, "CD R4OS") and ok;
-    ok = expectCwd(&state, "C:\\R4OS") and ok;
-    ok = expectBuiltin(&state, "CD ..") and ok;
-    ok = expectCwd(&state, "C:\\") and ok;
-    ok = expectFailure(&state, "CD IRGENDWAS") and ok;
-    ok = expectCwd(&state, "C:\\") and ok;
+    ok = expectBuiltin(state, "CD C:\\") and ok;
+    ok = expectCwd(state, "C:\\") and ok;
+    ok = expectBuiltin(state, "CD R4OS") and ok;
+    ok = expectCwd(state, "C:\\R4OS") and ok;
+    ok = expectBuiltin(state, "CD ..") and ok;
+    ok = expectCwd(state, "C:\\") and ok;
+    ok = expectFailure(state, "CD IRGENDWAS") and ok;
+    ok = expectCwd(state, "C:\\") and ok;
     if (state.directoryReady("D:\\")) {
-        ok = expectCommandOk(&state, "D:") and ok;
-        ok = expectCwd(&state, "D:\\") and ok;
-        ok = expectBuiltin(&state, "CD C:") and ok;
-        ok = expectCwd(&state, "C:\\") and ok;
+        ok = expectCommandOk(state, "D:") and ok;
+        ok = expectCwd(state, "D:\\") and ok;
+        ok = expectBuiltin(state, "CD C:") and ok;
+        ok = expectCwd(state, "C:\\") and ok;
     }
     if (!ok) {
-        sys.println("Terminal userland session selftest: FAILED");
+        state.println("Terminal userland session selftest: FAILED");
         return 1;
     }
     if (runInputSelftest(sys, false) != 0) return 1;
-    if (runBuiltinSelftest(sys, dev) != 0) return 1;
-    if (!runOutputTranscriptSelftest(sys, dev)) return 1;
-    sys.println("Terminal userland selftest: OK");
-    sys.println("Terminal loop: userland session/prompt/environment/input/history/built-ins/external launch/batch/redirection");
+    if (runBuiltinSelftest(state) != 0) return 1;
+    if (!runOutputTranscriptSelftest(sys, state.dev)) return 1;
+    state.println("Terminal userland selftest: OK");
+    state.println("Terminal loop: userland session/prompt/environment/input/history/built-ins/external launch/batch/redirection");
     return 0;
 }
 
-fn runOutputTest(sys: r4os.r4sys.Context) i32 {
+fn runOutputTest(state: *TerminalState) i32 {
     var iteration: u32 = 0;
-    while (iteration < OUTPUT_TEST_ITERATIONS) : (iteration += 1) sys.write(output_test_chunk);
+    while (iteration < OUTPUT_TEST_ITERATIONS) : (iteration += 1) state.write(output_test_chunk);
     return 0;
 }
 
@@ -1784,8 +1908,8 @@ fn runOutputTranscriptSelftest(sys: r4os.r4sys.Context, dev: r4os.r4dev.Context)
     return true;
 }
 
-fn runBuiltinSelftest(sys: r4os.r4sys.Context, dev: r4os.r4dev.Context) i32 {
-    var state = TerminalState{ .sys = sys, .dev = dev };
+fn runBuiltinSelftest(state: *TerminalState) i32 {
+    const sys = state.sys;
     if (!state.initializeSession()) return 1;
     var ok = true;
 
@@ -1794,80 +1918,79 @@ fn runBuiltinSelftest(sys: r4os.r4sys.Context, dev: r4os.r4dev.Context) i32 {
     _ = sys.fileDelete("C:\\CMDTEST\\CMDU3.TXT");
     _ = sys.fileDelete("C:\\CMDTEST\\SORT.TXT");
     _ = sys.dirDelete("C:\\CMDTEST");
-    ok = expectBuiltin(&state, "MD C:\\CMDTEST") and ok;
-    ok = expectBuiltin(&state, "CD CMDTEST") and ok;
-    ok = expectCwd(&state, "C:\\CMDTEST") and ok;
-    ok = expectBuiltin(&state, "DIR") and ok;
-    ok = expectFailure(&state, "CD NO_SUCH_DIR") and ok;
-    ok = expectCwd(&state, "C:\\CMDTEST") and ok;
-    ok = expectBuiltin(&state, "CD ..") and ok;
-    ok = expectCwd(&state, "C:\\") and ok;
+    ok = expectBuiltin(state, "MD C:\\CMDTEST") and ok;
+    ok = expectBuiltin(state, "CD CMDTEST") and ok;
+    ok = expectCwd(state, "C:\\CMDTEST") and ok;
+    ok = expectBuiltin(state, "DIR") and ok;
+    ok = expectFailure(state, "CD NO_SUCH_DIR") and ok;
+    ok = expectCwd(state, "C:\\CMDTEST") and ok;
+    ok = expectBuiltin(state, "CD ..") and ok;
+    ok = expectCwd(state, "C:\\") and ok;
     ok = writeFixture(sys, "C:\\CMDTEST\\CMDU.TXT", "TERMINAL USERLAND\r\n") and ok;
-    ok = expectBuiltin(&state, "WAITFILE 0 C:\\CMDTEST\\CMDU.TXT") and ok;
-    ok = expectFailure(&state, "WAITFILE 0 C:\\CMDTEST\\MISSING.TXT") and ok;
+    ok = expectBuiltin(state, "WAITFILE 0 C:\\CMDTEST\\CMDU.TXT") and ok;
+    ok = expectFailure(state, "WAITFILE 0 C:\\CMDTEST\\MISSING.TXT") and ok;
     ok = writeFixture(sys, "C:\\CMDTEST\\SORT.TXT", "zeta\r\nalpha\r\nBeta\r\n") and ok;
-    ok = expectBuiltin(&state, "CLS") and ok;
-    ok = expectBuiltin(&state, "VERIFY") and ok;
-    ok = expectBuiltin(&state, "VERIFY ON") and ok;
+    ok = expectBuiltin(state, "CLS") and ok;
+    ok = expectBuiltin(state, "VERIFY") and ok;
+    ok = expectBuiltin(state, "VERIFY ON") and ok;
     ok = state.verify_on and ok;
-    ok = expectBuiltin(&state, "VERIFY OFF") and ok;
+    ok = expectBuiltin(state, "VERIFY OFF") and ok;
     ok = !state.verify_on and ok;
-    ok = expectBuiltin(&state, "DATE") and ok;
-    ok = expectBuiltin(&state, "TIME") and ok;
-    ok = expectBuiltin(&state, "VOL") and ok;
-    ok = expectBuiltin(&state, "PAUSE /?") and ok;
-    ok = expectBuiltin(&state, "SLEEP 0") and ok;
-    ok = expectBuiltin(&state, "ECHO Terminal userland builtin echo") and ok;
-    ok = expectBuiltin(&state, "VER") and ok;
-    ok = expectBuiltin(&state, "TYPE C:\\CMDTEST\\CMDU.TXT") and ok;
-    ok = expectBuiltin(&state, "MORE C:\\CMDTEST\\CMDU.TXT") and ok;
-    ok = expectBuiltin(&state, "SORT C:\\CMDTEST\\SORT.TXT") and ok;
-    ok = expectBuiltin(&state, "DIR C:\\CMDTEST") and ok;
-    ok = expectBuiltin(&state, "COPY C:\\CMDTEST\\CMDU.TXT C:\\CMDTEST\\CMDU2.TXT") and ok;
+    ok = expectBuiltin(state, "DATE") and ok;
+    ok = expectBuiltin(state, "TIME") and ok;
+    ok = expectBuiltin(state, "VOL") and ok;
+    ok = expectBuiltin(state, "PAUSE /?") and ok;
+    ok = expectBuiltin(state, "SLEEP 0") and ok;
+    ok = expectBuiltin(state, "ECHO Terminal userland builtin echo") and ok;
+    ok = expectBuiltin(state, "VER") and ok;
+    ok = expectBuiltin(state, "TYPE C:\\CMDTEST\\CMDU.TXT") and ok;
+    ok = expectBuiltin(state, "MORE C:\\CMDTEST\\CMDU.TXT") and ok;
+    ok = expectBuiltin(state, "SORT C:\\CMDTEST\\SORT.TXT") and ok;
+    ok = expectBuiltin(state, "DIR C:\\CMDTEST") and ok;
+    ok = expectBuiltin(state, "COPY C:\\CMDTEST\\CMDU.TXT C:\\CMDTEST\\CMDU2.TXT") and ok;
     ok = sys.exists("C:\\CMDTEST\\CMDU2.TXT") and ok;
-    ok = expectBuiltin(&state, "DEL C:\\CMDTEST\\CMDU2.TXT") and ok;
+    ok = expectBuiltin(state, "DEL C:\\CMDTEST\\CMDU2.TXT") and ok;
     ok = !sys.exists("C:\\CMDTEST\\CMDU2.TXT") and ok;
-    ok = expectBuiltin(&state, "REN C:\\CMDTEST\\CMDU.TXT C:\\CMDTEST\\CMDU3.TXT") and ok;
+    ok = expectBuiltin(state, "REN C:\\CMDTEST\\CMDU.TXT C:\\CMDTEST\\CMDU3.TXT") and ok;
     ok = sys.exists("C:\\CMDTEST\\CMDU3.TXT") and ok;
-    ok = expectBuiltin(&state, "DEL C:\\CMDTEST\\CMDU3.TXT") and ok;
-    ok = expectFailure(&state, "TYPE C:\\CMDTEST\\MISSING.TXT") and ok;
+    ok = expectBuiltin(state, "DEL C:\\CMDTEST\\CMDU3.TXT") and ok;
+    ok = expectFailure(state, "TYPE C:\\CMDTEST\\MISSING.TXT") and ok;
     ok = state.errorlevel == 1 and ok;
-    ok = expectFailure(&state, "COPY C:\\CMDTEST\\MISSING.TXT C:\\CMDTEST\\NOPE.TXT") and ok;
-    ok = expectFailure(&state, "MD") and ok;
-    ok = expectFailure(&state, "COLOR 1F") and ok;
-    ok = expectFailure(&state, "TYPE C:\\AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA.TXT") and ok;
-    ok = expectBuiltin(&state, "DEL C:\\CMDTEST\\SORT.TXT") and ok;
-    ok = expectBuiltin(&state, "RD C:\\CMDTEST") and ok;
+    ok = expectFailure(state, "COPY C:\\CMDTEST\\MISSING.TXT C:\\CMDTEST\\NOPE.TXT") and ok;
+    ok = expectFailure(state, "MD") and ok;
+    ok = expectFailure(state, "COLOR 1F") and ok;
+    ok = expectFailure(state, "TYPE C:\\AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA.TXT") and ok;
+    ok = expectBuiltin(state, "DEL C:\\CMDTEST\\SORT.TXT") and ok;
+    ok = expectBuiltin(state, "RD C:\\CMDTEST") and ok;
 
     if (!ok) {
-        sys.println("Terminal builtins selftest: FAILED");
+        state.println("Terminal builtins selftest: FAILED");
         return 1;
     }
-    sys.println("Terminal builtins: userland echo/ver/type/dir/copy/del/ren/md/rd OK");
+    state.println("Terminal builtins: userland echo/ver/type/dir/copy/del/ren/md/rd OK");
     return 0;
 }
 
-fn runLaunchSelftest(sys: r4os.r4sys.Context, dev: r4os.r4dev.Context) i32 {
-    var state = TerminalState{ .sys = sys, .dev = dev };
+fn runLaunchSelftest(state: *TerminalState) i32 {
     if (!state.initializeSession()) return 1;
     var ok = true;
 
-    ok = expectProgramResolution(&state, "SPECTRA", 1) and ok;
-    ok = expectProgramResolution(&state, "SPECTRA.R4X", 1) and ok;
-    ok = expectProgramResolution(&state, "C:\\R4OS\\SOFTWARE\\TERMINAL\\DIAG\\SPECTRA.R4X", 1) and ok;
-    ok = expectProgramResolution(&state, "R4OS\\SOFTWARE\\TERMINAL\\DIAG\\SPECTRA.R4X", 1) and ok;
-    ok = expectCommandFailure(&state, "NO_SUCH_COMMAND") and ok;
+    ok = expectProgramResolution(state, "SPECTRA", 1) and ok;
+    ok = expectProgramResolution(state, "SPECTRA.R4X", 1) and ok;
+    ok = expectProgramResolution(state, "C:\\R4OS\\SOFTWARE\\TERMINAL\\DIAG\\SPECTRA.R4X", 1) and ok;
+    ok = expectProgramResolution(state, "R4OS\\SOFTWARE\\TERMINAL\\DIAG\\SPECTRA.R4X", 1) and ok;
+    ok = expectCommandFailure(state, "NO_SUCH_COMMAND") and ok;
 
     if (!ok) {
-        sys.println("Terminal launch selftest: FAILED");
+        state.println("Terminal launch selftest: FAILED");
         return 1;
     }
-    sys.println("Terminal launch: userland external program resolution OK");
+    state.println("Terminal launch: userland external program resolution OK");
     return 0;
 }
 
-fn runBatchSelftest(sys: r4os.r4sys.Context, dev: r4os.r4dev.Context) i32 {
-    var state = TerminalState{ .sys = sys, .dev = dev };
+fn runBatchSelftest(state: *TerminalState) i32 {
+    const sys = state.sys;
     if (!state.initializeSession()) return 1;
     var ok = true;
 
@@ -1877,23 +2000,23 @@ fn runBatchSelftest(sys: r4os.r4sys.Context, dev: r4os.r4dev.Context) i32 {
     _ = sys.fileDelete("C:\\CMDTEST\\BATCH.OUT");
     _ = sys.dirDelete("C:\\CMDTEST");
 
-    ok = checkBatchStep(sys, "mkdir", expectBuiltin(&state, "MD C:\\CMDTEST")) and ok;
+    ok = checkBatchStep(state, "mkdir", expectBuiltin(state, "MD C:\\CMDTEST")) and ok;
     state.executeLine("ECHO FIRST > C:\\CMDTEST\\REDIR.TXT");
-    ok = checkBatchStep(sys, "redirect truncate", state.errorlevel == 0 and fileContains(sys, "C:\\CMDTEST\\REDIR.TXT", "FIRST\r\n")) and ok;
+    ok = checkBatchStep(state, "redirect truncate", state.errorlevel == 0 and fileContains(sys, "C:\\CMDTEST\\REDIR.TXT", "FIRST\r\n")) and ok;
     state.executeLine("ECHO SECOND >> C:\\CMDTEST\\REDIR.TXT");
-    ok = checkBatchStep(sys, "redirect append", state.errorlevel == 0 and fileContains(sys, "C:\\CMDTEST\\REDIR.TXT", "FIRST\r\nSECOND\r\n")) and ok;
+    ok = checkBatchStep(state, "redirect append", state.errorlevel == 0 and fileContains(sys, "C:\\CMDTEST\\REDIR.TXT", "FIRST\r\nSECOND\r\n")) and ok;
     state.executeLine("TYPE C:\\CMDTEST\\REDIR.TXT > C:\\CMDTEST\\REDIR2.TXT");
-    ok = checkBatchStep(sys, "redirect type", state.errorlevel == 0 and fileStartsWith(sys, "C:\\CMDTEST\\REDIR2.TXT", "FIRST\r\nSECOND\r\n")) and ok;
-    ok = checkBatchStep(sys, "write batch fixture", writeFixture(sys, "C:\\CMDTEST\\BATCHT.BAT", "@ECHO OFF\r\nREM BATCH TEST\r\nECHO BATCH-OK > C:\\CMDTEST\\BATCH.OUT\r\n")) and ok;
+    ok = checkBatchStep(state, "redirect type", state.errorlevel == 0 and fileStartsWith(sys, "C:\\CMDTEST\\REDIR2.TXT", "FIRST\r\nSECOND\r\n")) and ok;
+    ok = checkBatchStep(state, "write batch fixture", writeFixture(sys, "C:\\CMDTEST\\BATCHT.BAT", "@ECHO OFF\r\nREM BATCH TEST\r\nECHO BATCH-OK > C:\\CMDTEST\\BATCH.OUT\r\n")) and ok;
     state.executeLine("C:\\CMDTEST\\BATCHT.BAT");
-    ok = checkBatchStep(sys, "run batch file", state.errorlevel == 0 and fileContains(sys, "C:\\CMDTEST\\BATCH.OUT", "BATCH-OK\r\n")) and ok;
+    ok = checkBatchStep(state, "run batch file", state.errorlevel == 0 and fileContains(sys, "C:\\CMDTEST\\BATCH.OUT", "BATCH-OK\r\n")) and ok;
     state.executeLine("ECHO X | MORE");
-    ok = checkBatchStep(sys, "pipe rejection", state.errorlevel != 0) and ok;
+    ok = checkBatchStep(state, "pipe rejection", state.errorlevel != 0) and ok;
     state.executeLine("SORT < C:\\CMDTEST\\REDIR.TXT");
-    ok = checkBatchStep(sys, "stdin rejection", state.errorlevel != 0) and ok;
+    ok = checkBatchStep(state, "stdin rejection", state.errorlevel != 0) and ok;
     state.executeLine("SPECTRA METRICS BOOT > C:\\CMDTEST\\SPECTRA.TXT");
-    ok = checkBatchStep(sys, "external redirection rejection", state.errorlevel != 0) and ok;
-    ok = checkBatchStep(sys, "batch control rejection", expectFailure(&state, "GOTO END")) and ok;
+    ok = checkBatchStep(state, "external redirection rejection", state.errorlevel != 0) and ok;
+    ok = checkBatchStep(state, "batch control rejection", expectFailure(state, "GOTO END")) and ok;
 
     _ = sys.fileDelete("C:\\CMDTEST\\SPECTRA.TXT");
     _ = sys.fileDelete("C:\\CMDTEST\\BATCH.OUT");
@@ -1903,17 +2026,17 @@ fn runBatchSelftest(sys: r4os.r4sys.Context, dev: r4os.r4dev.Context) i32 {
     _ = sys.dirDelete("C:\\CMDTEST");
 
     if (!ok) {
-        sys.println("Terminal batch/redirection selftest: FAILED");
+        state.println("Terminal batch/redirection selftest: FAILED");
         return 1;
     }
-    sys.println("Terminal batch/redirection: userland basics OK");
+    state.println("Terminal batch/redirection: userland basics OK");
     return 0;
 }
 
-fn checkBatchStep(sys: r4os.r4sys.Context, name: []const u8, ok: bool) bool {
+fn checkBatchStep(state: *TerminalState, name: []const u8, ok: bool) bool {
     if (!ok) {
-        sys.write("Terminal batch/redirection check failed: ");
-        sys.println(name);
+        state.write("Terminal batch/redirection check failed: ");
+        state.println(name);
     }
     return ok;
 }
@@ -1988,25 +2111,13 @@ fn modeFromArgs(args_raw: []const u8) Mode {
 
 fn commandFromArgs(args_raw: []const u8) ?[]const u8 {
     const args = trim(args_raw);
-    if (args.len == 0) return null;
-    if (commandAfterSwitch(args)) |command| return command;
-
-    const split = firstSpace(args) orelse return null;
-    const first = trim(args[0..split]);
-    if (!isNoAutoexecSwitch(first)) return null;
-    return commandAfterSwitch(trim(args[split + 1 ..]));
-}
-
-fn commandAfterSwitch(args: []const u8) ?[]const u8 {
-    const trimmed = trim(args);
-    if (trimmed.len == 0) return null;
-    const split = firstSpace(trimmed) orelse {
-        if (isCommandSwitch(trimmed)) return "";
-        return null;
-    };
-    const first = trim(trimmed[0..split]);
-    if (!isCommandSwitch(first)) return null;
-    return trim(trimmed[split + 1 ..]);
+    var failure: r4os.arguments.Failure = .{};
+    var cursor = r4os.arguments.ArgCursor.init(args, .{ .quotes = @intFromEnum(r4os.arguments.Quotes.none) }, &failure) catch return null;
+    var first = (cursor.next() catch return null) orelse return null;
+    if (isNoAutoexecSwitch(first.bytes(args) catch return null))
+        first = (cursor.next() catch return null) orelse return null;
+    if (!isCommandSwitch(first.bytes(args) catch return null)) return null;
+    return trim(cursor.remainingRaw() catch return null);
 }
 
 fn isCommandSwitch(value: []const u8) bool {
@@ -2015,12 +2126,6 @@ fn isCommandSwitch(value: []const u8) bool {
 
 fn isNoAutoexecSwitch(value: []const u8) bool {
     return equalsIgnoreCase(value, "/NOAUTOEXEC") or equalsIgnoreCase(value, "--NOAUTOEXEC") or equalsIgnoreCase(value, "--NO-AUTOEXEC");
-}
-
-fn zSpan(ptr: [*:0]const u8) []const u8 {
-    var len: usize = 0;
-    while (ptr[len] != 0) : (len += 1) {}
-    return ptr[0..len];
 }
 
 fn trim(s: []const u8) []const u8 {
@@ -2617,10 +2722,7 @@ fn upper(c: u8) u8 {
 
 /// Runs in its own console-host instance: there is no competing reader while
 /// the queue is filled. This proves transport/backpressure before editing.
-fn runInputProbe(sys: r4os.r4sys.Context, dev: r4os.r4dev.Context) i32 {
-    const bundle = sys.base.bundle orelse return 1;
-    var handle: r4os.abi.ProgramProcessHandle = .{};
-    if (bundle.raw.instance_id > 0xffffffff or sys.programOpenHandle(@intCast(bundle.raw.instance_id), &handle) != r4os.abi.program_handle_ok) return 2;
+fn runInputProbe(sys: r4os.r4sys.Context, dev: r4os.r4dev.Context, handle: r4os.abi.ProgramProcessHandle) i32 {
     var events: [64]r4os.abi.ConsoleInputEvent = @splat(r4os.input_events.text(0x20ac).?);
     var accepted: usize = 0;
     while (accepted < 1365) {

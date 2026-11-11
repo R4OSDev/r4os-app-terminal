@@ -4,7 +4,7 @@
 
 ## Package
 
-- Version: `0.1.17`
+- Version: `0.1.20`
 - Image target: `/R4OS/SOFTWARE/TERMINAL/TERMINAL.R4X`
 - Image scope: `slim`
 - Canonical project manifest: `module.R4MF`
@@ -22,7 +22,7 @@ On Windows:
 
     Build.bat
 
-On Linux or macOS:
+On Linux:
 
     ./Build.sh
 
@@ -73,10 +73,16 @@ Recovery carry the same correction; no broad shell or filesystem profile.
 
 ## Console input
 
-Typed console input uses R4DESK16 and R4STD CODEC_V1. Unicode scalars and logical keys remain separate; SSH stream bytes retain a per-instance UTF-8 decoder across reads. Backspace removes a complete scalar, and bounded history entries end at scalar boundaries. `/INPUTTEST` runs an isolated console child through full-queue, stale-handle, partial UTF-8 and real command/history checks, then starts the explicit Desktop input diagnostic through the process API. Run this combined check in standalone Terminal Mode with no other Desktop owner. `/SELFTEST` includes the console child without starting another Desktop. Grapheme editing and console rendering are separate roadmap work.
+Typed console input uses R4DESK Query2 and R4STD CODEC_V1. Unicode scalars and logical keys use distinct events. SSH stream bytes retain a per-instance UTF-8 decoder across reads. `/INPUTTEST` checks full-queue behavior, stale handles, partial UTF-8 and command history in an isolated console child. It then starts the Desktop input diagnostic. Run the combined check in standalone Terminal Mode. `/SELFTEST` runs the console portion.
 
 0.85.44: The command line removes complete Unicode17 extended graphemes
 and history clips only at those boundaries. Erasure still counts the
 existing per-scalar console cells; shaping and terminal width negotiation
 are separate. /GRAPHEMETEST covers combining/flag/ZWJ boundaries and the real private
 console-host command loop/history with typed and byte-stream ZWJ deletion.
+
+Start2 launches can bind stdin, stdout and stderr with LaunchIo. Terminal
+uses those bindings for input and output and passes them together to Start2
+children. Pipe input accepts LF and CRLF command lines and executes a final
+command at EOF. A regular Console launch can run either child generation. The
+console-specific input and text tests require the corresponding console streams.

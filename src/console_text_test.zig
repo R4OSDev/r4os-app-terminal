@@ -4,12 +4,6 @@ const r4os = @import("r4os");
 const r4std = @import("r4std");
 const std = @import("std");
 const path = "C:\\R4OS\\SOFTWARE\\TERMINAL\\TERMINAL.R4X";
-fn own(sys: r4os.r4sys.Context) ?r4os.abi.ProgramProcessHandle {
-    const bundle = sys.base.bundle orelse return null;
-    var handle: r4os.abi.ProgramProcessHandle = .{};
-    if (sys.programOpenHandle(@intCast(bundle.raw.instance_id), &handle) != r4os.abi.program_handle_ok) return null;
-    return handle;
-}
 fn snapshot(sys: r4os.r4sys.Context, id: u32, expected: []const u8) bool {
     var bytes: [16385]u8 = undefined;
     const count = sys.consoleOutput(id,&bytes);
@@ -19,8 +13,7 @@ fn stateIs(sys: r4os.r4sys.Context, id: u32, x: i32, y: i32) bool {
     var state: r4os.abi.ConsoleState = .{};
     return sys.consoleState(id,&state) == 0 and state.cursor_x == x and state.cursor_y == y;
 }
-pub fn probe(sys: r4os.r4sys.Context) i32 {
-    const handle = own(sys) orelse return 1;
+pub fn probe(sys: r4os.r4sys.Context, handle: r4os.abi.ProgramProcessHandle) i32 {
     const id = handle.instance_id;
     if (sys.consoleSetMetrics(id,8,4) != 0) return 2;
     var info: r4os.abi.ConsoleTextInfo = .{};
