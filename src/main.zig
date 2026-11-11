@@ -554,7 +554,8 @@ const TerminalState = struct {
             }
         }
         const selftest_launch = hasSelftestSwitch(parsed.args);
-        const console_mode_launch = selftest_launch or hasConsoleUtilitySwitch(parsed.args);
+        const service_selftest = resolved.class_id == 3 and selftest_launch;
+        const console_mode_launch = !service_selftest and (selftest_launch or hasConsoleUtilitySwitch(parsed.args));
         if (resolved.class_id == 3 and !selftest_launch) {
             _ = self.fail("Service programs cannot be launched from Terminal yet");
             return .failed;
@@ -586,6 +587,13 @@ const TerminalState = struct {
             self.setErrorlevel(1);
             return .failed;
         }
+        // A service keeps its actual class. Its output is captured separately
+        // from this terminal, so retain it across the owning child reap.
+        var observation: r4os.abi.ProgramObservationHandle = .{};
+        const retained = service_selftest and self.sys.programObservationRetain(&child, 0, &observation) == 0;
+        defer if (retained) {
+            _ = self.sys.programObservationRelease(&observation);
+        };
         const exit_code = switch (self.waitChild(child)) {
             .exited => |code| code,
             .failure => |raw| {
@@ -599,8 +607,32 @@ const TerminalState = struct {
                 return .failed;
             },
         };
+        if (service_selftest and (!retained or !self.writeServiceSelftestOutput(&observation, exit_code))) {
+            self.setErrorlevel(1);
+            return self.fail("Service selftest output unavailable");
+        }
         self.setErrorlevel(exit_code);
         return if (self.errorlevel == 0) .ok else .failed;
+    }
+
+    fn writeServiceSelftestOutput(self: *TerminalState, observation: *const r4os.abi.ProgramObservationHandle, exit_code: i32) bool {
+        const a = r4os.abi;
+        var completion: a.ProgramProcessCompletion = .{};
+        if (self.sys.programObservationWait(observation, 0, &completion) != 0 or
+            !std.meta.eql(completion.handle, observation.process) or
+            completion.flags & a.program_completion_flag_ready == 0 or
+            completion.app_class != @intFromEnum(a.ProgramInstanceClass.service) or
+            completion.exit_code != exit_code) return false;
+        var buffer: [512]u8 = undefined;
+        var offset: u32 = 0;
+        while (offset < completion.output_length) {
+            var count: u32 = 0;
+            if (self.sys.programObservationRead(observation, offset, &buffer, &count) != 0 or
+                count == 0 or count > buffer.len or count > completion.output_length - offset) return false;
+            self.write(buffer[0..count]);
+            offset += count;
+        }
+        return true;
     }
 
     fn waitChild(self: *const TerminalState, handle: r4os.abi.ProgramProcessHandle) r4os.app_resources.ProcessWait {
