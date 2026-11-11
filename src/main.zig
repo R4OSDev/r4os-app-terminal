@@ -590,7 +590,7 @@ const TerminalState = struct {
         // A service keeps its actual class. Its output is captured separately
         // from this terminal, so retain it across the owning child reap.
         var observation: r4os.abi.ProgramObservationHandle = .{};
-        const retained = service_selftest and self.sys.programObservationRetain(&child, 0, &observation) == 0;
+        var retained = service_selftest and self.sys.programObservationRetain(&child, 0, &observation) == 0;
         defer if (retained) {
             _ = self.sys.programObservationRelease(&observation);
         };
@@ -607,9 +607,11 @@ const TerminalState = struct {
                 return .failed;
             },
         };
-        if (service_selftest and (!retained or !self.writeServiceSelftestOutput(&observation, exit_code))) {
-            self.setErrorlevel(1);
-            return self.fail("Service selftest output unavailable");
+        if (service_selftest) {
+            const output_ok = retained and self.writeServiceSelftestOutput(&observation, exit_code);
+            const released = if (retained) self.sys.programObservationRelease(&observation) == 0 else false;
+            retained = false;
+            if (!output_ok or !released) return self.fail("Service selftest output unavailable");
         }
         self.setErrorlevel(exit_code);
         return if (self.errorlevel == 0) .ok else .failed;
