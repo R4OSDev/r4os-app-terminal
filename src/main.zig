@@ -587,8 +587,8 @@ const TerminalState = struct {
             self.setErrorlevel(1);
             return .failed;
         }
-        // A service keeps its actual class. Its output is captured separately
-        // from this terminal, so retain it across the owning child reap.
+        // A service keeps its actual class. Retain its completion across the
+        // owning reap; services need no console transcript.
         var observation: r4os.abi.ProgramObservationHandle = .{};
         var retained = service_selftest and self.sys.programObservationRetain(&child, 0, &observation) == 0;
         defer if (retained) {
@@ -608,20 +608,26 @@ const TerminalState = struct {
             },
         };
         if (service_selftest) {
-            const output_ok = retained and self.writeServiceSelftestOutput(&observation, exit_code);
+            var completion: r4os.abi.ProgramProcessCompletion = .{};
+            const output_ok = retained and self.writeServiceSelftestOutput(&observation, exit_code, &completion);
             const released = if (retained) self.sys.programObservationRelease(&observation) == 0 else false;
             retained = false;
             if (!output_ok or !released) return self.fail("Service selftest output unavailable");
+            var buffer: [384]u8 = undefined;
+            const receipt = std.fmt.bufPrint(&buffer, "Service selftest completed: {s} class=service exit={d} process={d}:{d} sequence={d} observation=released\r\n", .{ resolved.path, exit_code, completion.handle.instance_id, completion.handle.generation, completion.sequence }) catch
+                return self.fail("Service selftest receipt too long");
+            self.write(receipt);
         }
         self.setErrorlevel(exit_code);
         return if (self.errorlevel == 0) .ok else .failed;
     }
 
-    fn writeServiceSelftestOutput(self: *TerminalState, observation: *const r4os.abi.ProgramObservationHandle, exit_code: i32) bool {
+    fn writeServiceSelftestOutput(self: *TerminalState, observation: *const r4os.abi.ProgramObservationHandle, exit_code: i32, out: *r4os.abi.ProgramProcessCompletion) bool {
         const a = r4os.abi;
         var completion: a.ProgramProcessCompletion = .{};
         if (self.sys.programObservationWait(observation, 0, &completion) != 0 or
             !std.meta.eql(completion.handle, observation.process) or
+            completion.sequence == 0 or
             completion.flags & a.program_completion_flag_ready == 0 or
             completion.app_class != @intFromEnum(a.ProgramInstanceClass.service) or
             completion.exit_code != exit_code) return false;
@@ -634,6 +640,7 @@ const TerminalState = struct {
             self.write(buffer[0..count]);
             offset += count;
         }
+        out.* = completion;
         return true;
     }
 
