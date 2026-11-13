@@ -2676,8 +2676,7 @@ fn hasSelftestSwitch(s: []const u8) bool {
         if (equalsIgnoreCase(token, "/SELFTEST") or equalsIgnoreCase(token, "--SELFTEST") or
             equalsIgnoreCase(token, "/PERFTEST") or equalsIgnoreCase(token, "--PERFTEST") or
             equalsIgnoreCase(token, "/APUTEST") or equalsIgnoreCase(token, "--APUTEST") or
-            equalsIgnoreCase(token, "/PERSISTTEST") or equalsIgnoreCase(token, "--PERSISTTEST") or
-            equalsIgnoreCase(token, "/HOSTTEST") or equalsIgnoreCase(token, "--HOSTTEST")) return true;
+            equalsIgnoreCase(token, "/PERSISTTEST") or equalsIgnoreCase(token, "--PERSISTTEST")) return true;
     }
     return false;
 }
