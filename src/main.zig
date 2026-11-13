@@ -2669,10 +2669,15 @@ fn isHelpSwitch(args: []const u8) bool {
 }
 
 fn hasSelftestSwitch(s: []const u8) bool {
+    // Native diagnostics must enter without a GUI attach, including after
+    // the headless Desktop has handed rendering over to Terminal Mode.
     var pos: usize = 0;
     while (nextToken(s, &pos)) |token| {
         if (equalsIgnoreCase(token, "/SELFTEST") or equalsIgnoreCase(token, "--SELFTEST") or
-            equalsIgnoreCase(token, "/PERFTEST") or equalsIgnoreCase(token, "--PERFTEST")) return true;
+            equalsIgnoreCase(token, "/PERFTEST") or equalsIgnoreCase(token, "--PERFTEST") or
+            equalsIgnoreCase(token, "/APUTEST") or equalsIgnoreCase(token, "--APUTEST") or
+            equalsIgnoreCase(token, "/PERSISTTEST") or equalsIgnoreCase(token, "--PERSISTTEST") or
+            equalsIgnoreCase(token, "/HOSTTEST") or equalsIgnoreCase(token, "--HOSTTEST")) return true;
     }
     return false;
 }
